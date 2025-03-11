@@ -1,0 +1,63 @@
+[package]
+name = "opencommit"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Auto-generate meaningful commits in a second using AI"
+repository = "https://github.com/yourusername/opencommit-rs"
+license = "MIT"
+readme = "README.md"
+keywords = ["git", "commit", "ai", "openai", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "rac"
+path = "src/main.rs"
+
+[dependencies]
+# CLI and user interface
+clap = { version = "4.4", features = ["derive"] }
+inquire = "0.6"
+colored = "2.1"
+indicatif = "0.17" # For progress indicators
+
+# Async runtime and HTTP
+tokio = { version = "1.35", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+
+# Serialization and configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+config = "0.13"
+dotenv = "0.15"
+
+# File and path handling
+dirs = "5.0"
+ignore = "0.4"
+walkdir = "2.4"
+
+# Git operations
+git2 = "0.18"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utils
+tiktoken-rs = "0.5" # For token counting
+sha2 = "0.10" # For hashing
+rand = "0.8" # For randomness
+chrono = "0.4" # For date/time
+async-trait = "0.1" # For async traits
+log = "0.4"
+env_logger = "0.10"
+once_cell = "1.19" # For lazy initialization
+semver = "1.0" # For version checking
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
