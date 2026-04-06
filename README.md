@@ -232,7 +232,7 @@ When `ACR_TRACK_GENERATED_COMMITS=1` (default), cgen records each AI-generated c
 
 ## Providers
 
-Built-in providers: **Groq** (default), **OpenAI**, **Anthropic**, **Gemini**, **Grok**, **DeepSeek**, **OpenRouter**, **Mistral**, **Together**, **Fireworks**, **Perplexity**, **LM Studio**.
+Built-in providers: **Groq** (default), **OpenAI**, **Anthropic**, **Gemini**, **Grok**, **DeepSeek**, **OpenRouter**, **Mistral**, **Together**, **Fireworks**, **Perplexity**, **LM Studio**, **Ollama**.
 
 | Provider | Default Model |
 |----------|---------------|
@@ -248,13 +248,14 @@ Built-in providers: **Groq** (default), **OpenAI**, **Anthropic**, **Gemini**, *
 | fireworks | accounts/fireworks/models/llama-v3p3-70b-instruct |
 | perplexity | sonar |
 | lm_studio | qwen/qwen3.5-35b-a3b |
+| ollama | llama3 |
 
 For custom providers, set `ACR_PROVIDER` to any name and provide `ACR_API_URL`. Custom providers default to OpenAI-compatible request format.
 
 ```sh
-export ACR_PROVIDER=ollama
-export ACR_API_URL=http://localhost:11434/v1/chat/completions
-export ACR_MODEL=llama3
+export ACR_PROVIDER=vllm
+export ACR_API_URL=http://localhost:8000/v1/chat/completions
+export ACR_MODEL=meta-llama/Llama-3-8B
 ```
 
 ## Testing and Coverage

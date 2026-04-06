@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -
 
+## [1.3.0]
+
+### Added
+
+- Added oLLaMa as a built-in provider
+
 ## [1.2.2] - 2026-03-05
 
 ### Fixed

@@ -110,6 +110,13 @@ fn get_provider(name: &str) -> Option<ProviderDef> {
             format: RequestFormat::LmStudio,
             response_path: "output",
         }),
+        "ollama" => Some(ProviderDef {
+            api_url: "http://localhost:11434/v1/chat/completions",
+            api_headers: "Content-Type: application/json",
+            default_model: "llama3",
+            format: RequestFormat::OpenAiCompat,
+            response_path: "choices.0.message.content",
+        }),
         _ => None,
     }
 }
@@ -611,6 +618,7 @@ mod tests {
         assert!(get_provider("fireworks").is_some());
         assert!(get_provider("perplexity").is_some());
         assert!(get_provider("lm_studio").is_some());
+        assert!(get_provider("ollama").is_some());
     }
 
     #[test]
@@ -649,6 +657,7 @@ mod tests {
             "together",
             "fireworks",
             "perplexity",
+            "ollama",
         ] {
             let provider = get_provider(name).unwrap();
             assert_eq!(
@@ -669,11 +678,25 @@ mod tests {
     }
 
     #[test]
+    fn test_get_provider_ollama_format() {
+        let provider = get_provider("ollama").unwrap();
+        assert_eq!(provider.format, RequestFormat::OpenAiCompat);
+        assert_eq!(
+            provider.api_url,
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(provider.api_headers, "Content-Type: application/json");
+        assert_eq!(provider.default_model, "llama3");
+        assert_eq!(provider.response_path, "choices.0.message.content");
+    }
+
+    #[test]
     fn test_default_model_for_known() {
         assert_eq!(default_model_for("groq"), "llama-3.3-70b-versatile");
         assert_eq!(default_model_for("openai"), "gpt-4o-mini");
         assert_eq!(default_model_for("anthropic"), "claude-sonnet-4-20250514");
         assert_eq!(default_model_for("lm_studio"), "qwen/qwen3.5-35b-a3b");
+        assert_eq!(default_model_for("ollama"), "llama3");
     }
 
     #[test]
