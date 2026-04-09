@@ -13,6 +13,7 @@ fn cfg_for(provider_name: &str, api_url: String) -> AppConfig {
     cfg.model = "test-model".into();
     cfg.api_key = "test-key".into();
     cfg.api_url = api_url;
+    cfg.fallback_enabled = false;
     cfg
 }
 
@@ -56,6 +57,59 @@ fn default_model_for_all_known_providers() {
         provider::default_model_for("lm_studio"),
         "qwen/qwen3.5-35b-a3b"
     );
+}
+
+#[test]
+fn provider_requires_api_key_returns_false_for_local_providers() {
+    let ollama_cfg = cfg_for("ollama", "http://localhost:11434/v1/chat/completions".into());
+    assert!(!provider::provider_requires_api_key(&ollama_cfg));
+
+    let lm_studio_cfg = cfg_for("lm_studio", "http://localhost:1234/api/v1/chat".into());
+    assert!(!provider::provider_requires_api_key(&lm_studio_cfg));
+}
+
+#[test]
+fn provider_requires_api_key_returns_true_for_cloud_providers() {
+    let openai_cfg = cfg_for("openai", String::new());
+    assert!(provider::provider_requires_api_key(&openai_cfg));
+
+    let gemini_cfg = cfg_for("gemini", String::new());
+    assert!(provider::provider_requires_api_key(&gemini_cfg));
+
+    let anthropic_cfg = cfg_for("anthropic", String::new());
+    assert!(provider::provider_requires_api_key(&anthropic_cfg));
+}
+
+#[test]
+fn call_llm_rejects_empty_response_content() {
+    let mut server = Server::new();
+    let mock = server
+        .mock("POST", "/empty")
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":""}}]}"#)
+        .create();
+
+    let cfg = cfg_for("openai", format!("{}/empty", server.url()));
+    let err = provider::call_llm(&cfg, "system", "diff")
+        .expect_err("empty content should fail");
+    assert!(err.to_string().contains("empty commit message"));
+    mock.assert();
+}
+
+#[test]
+fn call_llm_rejects_whitespace_only_response_content() {
+    let mut server = Server::new();
+    let mock = server
+        .mock("POST", "/whitespace")
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":"   \n  "}}]}"#)
+        .create();
+
+    let cfg = cfg_for("openai", format!("{}/whitespace", server.url()));
+    let err = provider::call_llm(&cfg, "system", "diff")
+        .expect_err("whitespace-only content should fail");
+    assert!(err.to_string().contains("empty commit message"));
+    mock.assert();
 }
 
 #[test]

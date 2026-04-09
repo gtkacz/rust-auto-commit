@@ -248,7 +248,7 @@ fn run_alter(cfg: &config::AppConfig, cli: &cli::Cli, commits: &[String]) -> Res
 }
 
 fn ensure_api_key(cfg: &config::AppConfig) -> Result<()> {
-    if cfg.api_key.is_empty() {
+    if provider::provider_requires_api_key(cfg) && cfg.api_key.is_empty() {
         anyhow::bail!(
             "No API key configured. Run {} or set {}",
             "cgen config".yellow(),
@@ -272,6 +272,13 @@ fn generate_final_message(
     let (raw_message, fallback_name) = provider::call_llm_with_fallback(cfg, &system_prompt, diff)
         .context("LLM API call failed")?;
     let mut message = prompt::clean_commit_message(&raw_message);
+
+    if message.is_empty() {
+        anyhow::bail!(
+            "LLM returned a message that was empty after cleaning. Raw response: {:?}",
+            raw_message
+        );
+    }
 
     if let Some(ref name) = fallback_name {
         println!(

@@ -23,7 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -
 
-## [1.3.0]
+## [1.3.1] - 2026-04-09
+
+### Fixed
+
+- Fixed oLLaMa streaming content issue
+
+## [1.3.0] - 2026-04-06
 
 ### Added
 

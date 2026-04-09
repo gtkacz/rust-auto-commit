@@ -126,6 +126,31 @@ pub fn default_model_for(provider: &str) -> &'static str {
     get_provider(provider).map_or("", |p| p.default_model)
 }
 
+/// Returns true if the provider requires an API key (i.e. its header template references $ACR_API_KEY).
+pub fn provider_requires_api_key(cfg: &AppConfig) -> bool {
+    let headers = if let Some(def) = get_provider(&cfg.provider) {
+        if cfg.api_headers.is_empty() {
+            def.api_headers.to_string()
+        } else {
+            cfg.api_headers.clone()
+        }
+    } else {
+        cfg.api_headers.clone()
+    };
+
+    let url = if let Some(def) = get_provider(&cfg.provider) {
+        if cfg.api_url.is_empty() {
+            def.api_url.to_string()
+        } else {
+            cfg.api_url.clone()
+        }
+    } else {
+        cfg.api_url.clone()
+    };
+
+    headers.contains("$ACR_API_KEY") || url.contains("$ACR_API_KEY")
+}
+
 pub enum LlmCallError {
     HttpError { code: u16, body: String },
     TransportError(String),
@@ -167,7 +192,10 @@ fn call_llm_inner(
     spinner.set_message("Generating commit message...");
     spinner.enable_steady_tick(Duration::from_millis(80));
 
-    let mut req = ureq::post(&url);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(120))
+        .build();
+    let mut req = agent.post(&url);
     for (key, val) in &headers {
         req = req.set(key, val);
     }
@@ -200,6 +228,13 @@ fn call_llm_inner(
             e
         ))
     })?;
+
+    if message.trim().is_empty() {
+        return Err(LlmCallError::Other(anyhow::anyhow!(
+            "LLM returned an empty commit message. Full response:\n{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        )));
+    }
 
     Ok(message)
 }
@@ -347,7 +382,8 @@ fn build_request_body(
                     { "role": "user", "content": diff }
                 ],
                 "max_tokens": 512,
-                "temperature": 0
+                "temperature": 0,
+                "stream": false
             })
         }
         RequestFormat::Anthropic => {
@@ -357,7 +393,8 @@ fn build_request_body(
                 "messages": [
                     { "role": "user", "content": diff }
                 ],
-                "max_tokens": 512
+                "max_tokens": 512,
+                "stream": false
             })
         }
         RequestFormat::LmStudio => {
