@@ -251,7 +251,7 @@ index ccccccc..ddddddd 100644
 
     // Exclude *.json and *.csv
     let patterns = vec!["*.json".to_string(), "*.csv".to_string()];
-    let filtered = git::filter_diff_by_globs(diff, &patterns);
+    let filtered = git::filter_diff_by_globs(diff, &[], &patterns);
 
     // Should contain main.rs changes
     assert!(filtered.contains("src/main.rs"));
@@ -265,7 +265,7 @@ index ccccccc..ddddddd 100644
 #[test]
 fn filter_diff_by_globs_returns_full_diff_when_no_patterns() {
     let diff = "diff --git a/foo.json b/foo.json\n+test\n";
-    let filtered = git::filter_diff_by_globs(diff, &[]);
+    let filtered = git::filter_diff_by_globs(diff, &[], &[]);
     assert_eq!(filtered, diff);
 }
 
@@ -284,7 +284,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 "#;
 
     let patterns = vec!["*.json".to_string()];
-    let filtered = git::filter_diff_by_globs(diff, &patterns);
+    let filtered = git::filter_diff_by_globs(diff, &[], &patterns);
 
     // Should contain lib.rs but not the nested json file
     assert!(filtered.contains("src/lib.rs"));
@@ -296,7 +296,7 @@ fn filter_diff_by_globs_invalid_pattern_ignored() {
     let diff = "diff --git a/test.rs b/test.rs\n+code\n";
     // Invalid glob pattern should be silently ignored
     let patterns = vec!["[invalid".to_string(), "*.rs".to_string()];
-    let filtered = git::filter_diff_by_globs(diff, &patterns);
+    let filtered = git::filter_diff_by_globs(diff, &[], &patterns);
     // Since *.rs matches, the diff should be filtered out
     assert!(!filtered.contains("test.rs"));
 }
@@ -321,7 +321,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 "#;
 
     let patterns = vec!["*.lock".to_string()];
-    let filtered = git::filter_diff_by_globs(diff, &patterns);
+    let filtered = git::filter_diff_by_globs(diff, &[], &patterns);
 
     // Should keep .rs files, exclude .lock
     assert!(filtered.contains("main.rs"));

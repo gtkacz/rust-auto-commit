@@ -695,6 +695,31 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Apply ephemeral `--set KEY=VALUE` overrides as the highest-priority layer.
+    /// Never persisted. Errors on malformed entries, unknown keys, or `auto_update`.
+    pub fn apply_overrides(&mut self, overrides: &[String]) -> Result<()> {
+        for entry in overrides {
+            let (raw_key, value) = entry
+                .split_once('=')
+                .with_context(|| format!("Invalid --set '{entry}'. Expected KEY=VALUE."))?;
+            let suffix = normalize_override_key(raw_key);
+            if suffix == "AUTO_UPDATE" {
+                anyhow::bail!(
+                    "'auto_update' cannot be overridden per-invocation; it is a persistent global preference. Use `cgen config`."
+                );
+            }
+            if !ENV_FIELD_MAP.iter().any(|(s, _)| *s == suffix) {
+                anyhow::bail!(
+                    "Unknown setting '{raw_key}'. Valid keys: {}",
+                    overridable_keys().join(", ")
+                );
+            }
+            self.set_field(&suffix, value)
+                .with_context(|| format!("Failed to apply --set {raw_key}={value}"))?;
+        }
+        Ok(())
+    }
+
     fn ensure_valid_locale(&mut self) -> Result<()> {
         self.locale = normalize_locale(&self.locale);
         validate_locale(&self.locale)
@@ -751,6 +776,19 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max])
     }
+}
+
+fn normalize_override_key(key: &str) -> String {
+    key.trim().replace('-', "_").to_ascii_uppercase()
+}
+
+/// Field names overridable via `--set` (everything except auto_update).
+fn overridable_keys() -> Vec<String> {
+    ENV_FIELD_MAP
+        .iter()
+        .filter(|(s, _)| *s != "AUTO_UPDATE")
+        .map(|(_, field)| (*field).to_string())
+        .collect()
 }
 
 fn normalize_post_commit_push(value: &str) -> String {
@@ -1398,5 +1436,68 @@ mod tests {
         let original_provider = cfg.provider.clone();
         cfg.set_field("UNKNOWN_FIELD", "value").unwrap();
         assert_eq!(cfg.provider, original_provider);
+    }
+
+    #[test]
+    fn test_apply_overrides_beats_loaded_value() {
+        let mut cfg = AppConfig::default();
+        cfg.apply_overrides(&["model=gpt-4o".to_string()]).unwrap();
+        assert_eq!(cfg.model, "gpt-4o");
+    }
+
+    #[test]
+    fn test_apply_overrides_repeated_keys_last_wins() {
+        let mut cfg = AppConfig::default();
+        cfg.apply_overrides(&["model=a".to_string(), "model=b".to_string()])
+            .unwrap();
+        assert_eq!(cfg.model, "b");
+    }
+
+    #[test]
+    fn test_apply_overrides_case_and_hyphen_insensitive() {
+        let mut cfg = AppConfig::default();
+        cfg.apply_overrides(&["One-Liner=false".to_string()])
+            .unwrap();
+        assert!(!cfg.one_liner);
+    }
+
+    #[test]
+    fn test_apply_overrides_rejects_auto_update() {
+        let mut cfg = AppConfig::default();
+        let err = cfg
+            .apply_overrides(&["auto_update=true".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("auto_update"));
+    }
+
+    #[test]
+    fn test_apply_overrides_rejects_unknown_key() {
+        let mut cfg = AppConfig::default();
+        let err = cfg.apply_overrides(&["bogus=1".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("Unknown setting"));
+    }
+
+    #[test]
+    fn test_apply_overrides_rejects_missing_equals() {
+        let mut cfg = AppConfig::default();
+        let err = cfg.apply_overrides(&["one_liner".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("KEY=VALUE"));
+    }
+
+    #[test]
+    fn test_apply_overrides_value_with_equals_preserved() {
+        let mut cfg = AppConfig::default();
+        cfg.apply_overrides(&["commit_template=feat: $msg=done".to_string()])
+            .unwrap();
+        assert_eq!(cfg.commit_template, "feat: $msg=done");
+    }
+
+    #[test]
+    fn test_apply_overrides_propagates_locale_error() {
+        let mut cfg = AppConfig::default();
+        let err = cfg
+            .apply_overrides(&["locale=zz-invalid".to_string()])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Unsupported locale"));
     }
 }

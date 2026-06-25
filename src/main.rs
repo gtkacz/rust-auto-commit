@@ -21,7 +21,11 @@ fn run() -> Result<()> {
             | cli::Command::Preset
             | cli::Command::Fallback,
         ) => None,
-        _ => Some(config::AppConfig::load()?),
+        _ => {
+            let mut c = config::AppConfig::load()?;
+            c.apply_overrides(&cli.set)?;
+            Some(c)
+        }
     };
 
     // On first run, ask about auto-update preference
@@ -108,7 +112,13 @@ fn run_standard_commit(cfg: &config::AppConfig, cli: &cli::Cli) -> Result<()> {
     }
 
     let gen_start = Instant::now();
-    let diff = git::get_staged_diff_filtered(&cfg.diff_exclude_globs)
+    let excludes: Vec<String> = cfg
+        .diff_exclude_globs
+        .iter()
+        .chain(cli.diff_exclude.iter())
+        .cloned()
+        .collect();
+    let diff = git::get_staged_diff_filtered(&cli.diff_include, &excludes)
         .context("Failed to get staged diff")?;
     let Some((final_msg, time_to_ready)) =
         generate_final_message(cfg, &diff, cli.verbose, gen_start)?

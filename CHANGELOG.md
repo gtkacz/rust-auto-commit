@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- 
+- `--set KEY=VALUE` flag to override any setting for a single run (ephemeral, never persisted); `auto_update` excepted
+- `--diff-include GLOB` / `--diff-exclude GLOB` flags to refine which files are sent to the LLM for a single run (allow-over-deny precedence)
 
 ### Changed
 

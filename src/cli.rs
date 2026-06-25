@@ -32,6 +32,22 @@ pub struct Cli {
     #[arg(long)]
     pub tag: bool,
 
+    /// Override any setting for this run only (repeatable). Format: KEY=VALUE,
+    /// e.g. --set model=gpt-4o --set one_liner=false. Keys are case-insensitive
+    /// and accept '-' or '_'. Never persisted. `auto_update` cannot be overridden.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub set: Vec<String>,
+
+    /// Force-include files matching GLOB in the diff sent to the LLM, even if an
+    /// exclude pattern would drop them (repeatable). Quote globs: --diff-include "*.xml"
+    #[arg(long, value_name = "GLOB")]
+    pub diff_include: Vec<String>,
+
+    /// Additionally exclude files matching GLOB from the diff sent to the LLM for
+    /// this run (repeatable). Quote globs: --diff-exclude "*.sql"
+    #[arg(long, value_name = "GLOB")]
+    pub diff_exclude: Vec<String>,
+
     /// Extra arguments forwarded to `git commit`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub extra_args: Vec<String>,

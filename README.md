@@ -91,6 +91,9 @@ cgen                    # Generate commit message and commit
 cgen --dry-run          # Generate and show message without committing
 cgen --verbose          # Print final system prompt used for LLM call (diff omitted)
 cgen --tag              # Create next semantic version tag after commit
+cgen --set model=gpt-4o      # Override any setting for this run only (repeatable)
+cgen --diff-include "*.xml"  # Force-include matching files in the LLM diff (repeatable)
+cgen --diff-exclude "*.sql"  # Exclude extra files from the LLM diff this run (repeatable)
 cgen --no-verify        # Forward flags to git commit
 cgen alter <hash>       # Regenerate message from that commit's diff and rewrite it
 cgen alter <old> <new>  # Use old..new net diff, rewrite <new> message
@@ -107,7 +110,7 @@ Any arguments passed to `cgen` (without a subcommand) are forwarded directly to 
 
 ## Configuration
 
-All settings use the `ACR_` prefix. Layered resolution: defaults → global TOML → local `.env` → env vars.
+All settings use the `ACR_` prefix. Layered resolution: defaults → global TOML → local `.env` → env vars → CLI `--set` (highest priority, this run only).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -133,6 +136,21 @@ All settings use the `ACR_` prefix. Layered resolution: defaults → global TOML
 | `ACR_TRACK_GENERATED_COMMITS` | `1` | Track AI-generated commits per repository (`1`/`0`) |
 | `ACR_DIFF_EXCLUDE_GLOBS` | (see below) | Comma-separated glob patterns for files to exclude from LLM analysis |
 
+### Per-Invocation Overrides
+
+Any setting can be overridden for a single run with `--set KEY=VALUE` (repeatable). Overrides apply on top of all other layers and are **never persisted**:
+
+```sh
+cgen --set model=gpt-4o --set one_liner=false
+cgen --set provider=ollama        # try a different provider just this once
+```
+
+Keys are the setting names from the table above (case-insensitive; `-` and `_` are interchangeable, e.g. `one-liner`). Every setting is overridable except `auto_update` (a persistent global preference). Unknown keys are rejected with the list of valid keys.
+
+To refine which files are sent to the LLM for one run, use `--diff-include`/`--diff-exclude` (see [Diff Exclusion Patterns](#diff-exclusion-patterns)).
+
+> **Note:** `--set` and `--diff-*` flags must come before any arguments forwarded to `git commit`. Always quote globs so your shell does not expand them: `--diff-include "*.xml"`.
+
 ### Diff Exclusion Patterns
 
 `ACR_DIFF_EXCLUDE_GLOBS` filters files from the diff sent to the LLM while still committing them. This reduces noise and token usage for binary, generated, or data files. Default patterns:
@@ -146,6 +164,15 @@ Override with a comma-separated list:
 ```sh
 export ACR_DIFF_EXCLUDE_GLOBS="*.lock,*.svg,package-lock.json"
 ```
+
+For a single run, adjust the effective filter without touching your config:
+
+```sh
+cgen --diff-include "*.xml"   # send .xml files to the LLM even though they're excluded
+cgen --diff-exclude "*.sql"   # additionally drop .sql files from the LLM diff
+```
+
+`--diff-include` wins over any exclude pattern (allow-over-deny). These flags affect commit generation only; `cgen alter` always analyzes the full commit diff.
 
 Note: `ACR_AUTO_UPDATE` is a global-only setting and is not written to local `.env` files.
 

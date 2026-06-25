@@ -481,19 +481,18 @@ fn parse_semver_tag(tag: &str) -> Result<(u64, u64, u64)> {
     Ok((major, minor, patch))
 }
 
-/// Filter unified diff to exclude files matching glob patterns.
-/// Files matching any pattern are removed from the diff output but will still be committed.
-pub fn filter_diff_by_globs(diff: &str, exclude_patterns: &[String]) -> String {
-    if exclude_patterns.is_empty() {
-        return diff.to_string();
-    }
+/// Filter a unified diff. A file's hunk is kept when it matches an include glob
+/// (allow-over-deny) OR does not match any exclude glob. Matching is on filename.
+/// Excluded files are still committed, just not sent to the LLM for analysis.
+pub fn filter_diff_by_globs(
+    diff: &str,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> String {
+    let includes = compile_globs(include_patterns);
+    let excludes = compile_globs(exclude_patterns);
 
-    let patterns: Vec<Pattern> = exclude_patterns
-        .iter()
-        .filter_map(|p| Pattern::new(p).ok())
-        .collect();
-
-    if patterns.is_empty() {
+    if includes.is_empty() && excludes.is_empty() {
         return diff.to_string();
     }
 
@@ -514,7 +513,10 @@ pub fn filter_diff_by_globs(diff: &str, exclude_patterns: &[String]) -> String {
                 .and_then(|n| n.to_str())
                 .unwrap_or(file_path);
 
-            include_current = !patterns.iter().any(|p| p.matches(filename));
+            // Include wins over exclude (gitignore-`!` semantics).
+            let allowed = includes.iter().any(|p| p.matches(filename));
+            let denied = excludes.iter().any(|p| p.matches(filename));
+            include_current = allowed || !denied;
         }
 
         if include_current {
@@ -526,11 +528,25 @@ pub fn filter_diff_by_globs(diff: &str, exclude_patterns: &[String]) -> String {
     result
 }
 
-/// Get staged diff with files filtered by glob patterns.
+fn compile_globs(patterns: &[String]) -> Vec<Pattern> {
+    patterns
+        .iter()
+        .filter_map(|p| Pattern::new(p).ok())
+        .collect()
+}
+
+/// Get staged diff with files filtered by include/exclude globs.
 /// Excluded files are still committed, just not sent to the LLM for analysis.
-pub fn get_staged_diff_filtered(exclude_patterns: &[String]) -> Result<String> {
+pub fn get_staged_diff_filtered(
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Result<String> {
     let diff = get_staged_diff()?;
-    Ok(filter_diff_by_globs(&diff, exclude_patterns))
+    Ok(filter_diff_by_globs(
+        &diff,
+        include_patterns,
+        exclude_patterns,
+    ))
 }
 
 #[cfg(test)]
@@ -638,14 +654,14 @@ mod tests {
         let diff = "diff --git a/test.rs b/test.rs\n+code\n";
         // All patterns are invalid - should return full diff
         let patterns = vec!["[invalid".to_string(), "[also[bad".to_string()];
-        let filtered = filter_diff_by_globs(diff, &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns);
         assert_eq!(filtered, diff);
     }
 
     #[test]
     fn test_filter_diff_empty_diff() {
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs("", &patterns);
+        let filtered = filter_diff_by_globs("", &[], &patterns);
         assert_eq!(filtered, "");
     }
 
@@ -654,7 +670,7 @@ mod tests {
         // Content without proper diff header
         let content = "just some random text\nwithout diff headers";
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(content, &patterns);
+        let filtered = filter_diff_by_globs(content, &[], &patterns);
         // Should keep content since no diff header matched
         assert!(filtered.contains("random text"));
     }
@@ -664,7 +680,7 @@ mod tests {
         // Diff header without proper format
         let diff = "diff --git \n+something\n";
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns);
         // Should keep since filename extraction fails and defaults to include
         assert!(filtered.contains("something"));
     }
@@ -720,7 +736,7 @@ mod tests {
     fn test_filter_diff_single_file_excluded() {
         let diff = "diff --git a/config.json b/config.json\n+{}\n";
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns);
         assert!(filtered.is_empty() || !filtered.contains("config.json"));
     }
 
@@ -736,7 +752,7 @@ mod tests {
  }
 "#;
         let patterns = vec!["*.json".to_string()]; // Won't match .rs
-        let filtered = filter_diff_by_globs(diff, &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns);
         assert!(filtered.contains("fn main()"));
         assert!(filtered.contains("println!"));
         assert!(filtered.contains("old_code"));
@@ -752,7 +768,7 @@ diff --git a/c.rs b/c.rs
 +third
 "#;
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns);
         assert!(!filtered.contains("first"));
         assert!(!filtered.contains("second"));
         assert!(filtered.contains("third"));
@@ -803,7 +819,7 @@ diff --git a/src/app.ts b/src/app.ts
 +// TypeScript code
 "#;
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns);
 
         assert!(filtered.contains("readme.md"));
         assert!(filtered.contains("Documentation"));
@@ -816,7 +832,7 @@ diff --git a/src/app.ts b/src/app.ts
     fn test_filter_diff_special_characters_in_path() {
         let diff = "diff --git a/path with spaces/file.rs b/path with spaces/file.rs\n+code\n";
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns);
         assert!(filtered.contains("code"));
     }
 
@@ -831,5 +847,42 @@ diff --git a/src/app.ts b/src/app.ts
         // Invalid semver should return error
         let result = compute_next_minor_tag(Some("not-semver"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_filter_diff_include_overrides_exclude() {
+        let diff = "diff --git a/data.xml b/data.xml\n+<root/>\n";
+        let include = vec!["*.xml".to_string()];
+        let exclude = vec!["*.xml".to_string()];
+        let filtered = filter_diff_by_globs(diff, &include, &exclude);
+        assert!(filtered.contains("data.xml"));
+        assert!(filtered.contains("<root/>"));
+    }
+
+    #[test]
+    fn test_filter_diff_extra_exclude_drops_file() {
+        let diff = "diff --git a/schema.sql b/schema.sql\n+CREATE TABLE x;\n";
+        let exclude = vec!["*.sql".to_string()];
+        let filtered = filter_diff_by_globs(diff, &[], &exclude);
+        assert!(!filtered.contains("schema.sql"));
+        assert!(!filtered.contains("CREATE TABLE"));
+    }
+
+    #[test]
+    fn test_filter_diff_empty_include_matches_legacy_behavior() {
+        let diff = "diff --git a/a.json b/a.json\n+{}\ndiff --git a/b.rs b/b.rs\n+code\n";
+        let exclude = vec!["*.json".to_string()];
+        let filtered = filter_diff_by_globs(diff, &[], &exclude);
+        assert!(!filtered.contains("a.json"));
+        assert!(filtered.contains("b.rs"));
+    }
+
+    #[test]
+    fn test_filter_diff_include_and_exclude_both_match_includes() {
+        let diff = "diff --git a/keep.xml b/keep.xml\n+<a/>\n";
+        let include = vec!["keep.xml".to_string()];
+        let exclude = vec!["*.xml".to_string()];
+        let filtered = filter_diff_by_globs(diff, &include, &exclude);
+        assert!(filtered.contains("keep.xml"));
     }
 }
