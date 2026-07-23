@@ -9,8 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `--set KEY=VALUE` flag to override any setting for a single run (ephemeral, never persisted); `auto_update` excepted
-- `--diff-include GLOB` / `--diff-exclude GLOB` flags to refine which files are sent to the LLM for a single run (allow-over-deny precedence)
 - Sparse project `.env` overrides with an interactive “Inherit global value” action
 - Configurable diff byte/sensitive-path guards and explicit `--allow-large-diff` / `--allow-sensitive` overrides
 - Linux ARM64 and x86_64 musl release artifacts with SHA-256 manifests
@@ -54,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - High-MSRV `edit` dependency; editor launching is handled internally
+
+## [1.3.2] - 2026-06-25
+
+### Added
+
+- `--set KEY=VALUE` flag to override any setting for a single run (ephemeral, never persisted); `auto_update` excepted
+- `--diff-include GLOB` / `--diff-exclude GLOB` flags to refine which files are sent to the LLM for a single run (allow-over-deny precedence)
 
 ## [1.3.1] - 2026-04-09
 
