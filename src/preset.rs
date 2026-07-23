@@ -26,8 +26,6 @@ pub struct Preset {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FallbackConfig {
-    #[serde(default = "crate::config::default_true")]
-    pub enabled: bool,
     #[serde(default)]
     pub order: Vec<u32>,
 }
@@ -846,12 +844,10 @@ mod tests {
     #[test]
     fn test_fallback_config_serde() {
         let config = FallbackConfig {
-            enabled: true,
             order: vec![1, 2, 3],
         };
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: FallbackConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.enabled);
         assert_eq!(parsed.order, vec![1, 2, 3]);
     }
 

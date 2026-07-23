@@ -104,7 +104,6 @@ fn presets_file_default() {
 fn fallback_config_default() {
     let config = FallbackConfig::default();
     assert!(config.order.is_empty());
-    // enabled defaults to true via serde default
 }
 
 #[test]
@@ -312,4 +311,17 @@ fn presets_file_is_owner_only() {
         fs::metadata(path).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+#[test]
+fn presets_file_ignores_legacy_fallback_enabled_key() {
+    let legacy = r#"
+next_id = 0
+
+[fallback]
+enabled = true
+order = []
+"#;
+    let parsed: PresetsFile = toml::from_str(legacy).unwrap();
+    assert!(parsed.fallback.order.is_empty());
 }
