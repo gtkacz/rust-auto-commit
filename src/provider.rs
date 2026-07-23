@@ -301,12 +301,9 @@ pub fn call_llm_with_fallback(
                     None => continue,
                 };
 
-                // Skip if this preset matches current config (dedup key comparison)
-                if preset.fields.provider == current_fields.provider
-                    && preset.fields.model == current_fields.model
-                    && preset.fields.api_key == current_fields.api_key
-                    && preset.fields.api_url == current_fields.api_url
-                {
+                // Skip only presets identical to the active config; one that
+                // differs in any field (headers included) is a real alternative
+                if preset.fields == current_fields {
                     continue;
                 }
 

@@ -294,6 +294,63 @@ order = [0]
 }
 
 #[test]
+#[serial]
+fn call_llm_with_fallback_tries_preset_differing_only_in_headers() {
+    let mut server = Server::new();
+
+    // Primary (no X-Route header) fails with a retryable status
+    let mock_primary = server
+        .mock("POST", "/shared")
+        .match_header("x-route", Matcher::Missing)
+        .with_status(500)
+        .with_body("server error")
+        .create();
+
+    // Same URL: the preset differs from the active config only by a header
+    let mock_fallback = server
+        .mock("POST", "/shared")
+        .match_header("x-route", "fallback")
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":"fix: header fallback"}}]}"#)
+        .create();
+
+    let mut cfg = cfg_for("custom", format!("{}/shared", server.url()));
+    cfg.fallback_enabled = true;
+
+    let cfg_dir = tempfile::TempDir::new().expect("tempdir");
+    let _env = EnvGuard::set(&[("ACR_CONFIG_HOME", cfg_dir.path().to_string_lossy().as_ref())]);
+    let cgen_dir = cfg_dir.path().join("cgen");
+    fs::create_dir_all(&cgen_dir).expect("create cgen dir");
+
+    let presets_toml = format!(
+        r#"
+next_id = 1
+[[presets]]
+id = 0
+name = "header-preset"
+provider = "custom"
+model = "test-model"
+api_key = "test-key"
+api_url = "{}/shared"
+api_headers = "X-Route: fallback"
+
+[fallback]
+order = [0]
+"#,
+        server.url()
+    );
+    fs::write(cgen_dir.join("presets.toml"), presets_toml).expect("write presets");
+
+    let (msg, preset_name) = provider::call_llm_with_fallback(&cfg, "system", "diff")
+        .expect("preset differing only in headers should be attempted");
+
+    assert_eq!(msg, "fix: header fallback");
+    assert_eq!(preset_name, Some("header-preset".to_string()));
+    mock_primary.assert();
+    mock_fallback.assert();
+}
+
+#[test]
 fn call_llm_deepseek_provider() {
     let mut server = Server::new();
     let mock = server
