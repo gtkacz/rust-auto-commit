@@ -14,12 +14,6 @@ pub struct FieldGroup {
     pub subgroups: Vec<FieldSubgroup>,
 }
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are to act as an author of a commit message in git.
-Your mission is to create clean and comprehensive commit messages as per
-the Conventional Commit specification and explain WHAT were the changes and mainly WHY the changes were done.
-I'll send you an output of 'git diff --staged' command, and you are to convert
-it into a commit message. Use the present tense.";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_provider")]
@@ -127,7 +121,9 @@ fn default_commit_template() -> String {
     "$msg".into()
 }
 fn default_system_prompt() -> String {
-    DEFAULT_SYSTEM_PROMPT.into()
+    // Blank means "use the built-in default", so prompt upgrades reach configs
+    // that never customized it (crate::prompt resolves the actual text)
+    String::new()
 }
 fn default_gitmoji_format() -> String {
     "unicode".into()
@@ -450,7 +446,11 @@ impl AppConfig {
             (
                 "System Prompt",
                 "LLM_SYSTEM_PROMPT",
-                truncate(&self.llm_system_prompt, 60),
+                if crate::prompt::base_prompt_is_default(&self.llm_system_prompt) {
+                    "(built-in default)".into()
+                } else {
+                    truncate(&self.llm_system_prompt, 60)
+                },
             ),
             (
                 "Use Gitmoji",

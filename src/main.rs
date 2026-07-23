@@ -296,11 +296,8 @@ fn generate_final_message(
         println!("\n{}", "LLM system prompt:".cyan().bold());
         println!("{system_prompt}\n");
     }
-    let (raw_message, fallback_name) = provider::call_llm_with_fallback(cfg, &system_prompt, diff)
-        .context("LLM API call failed")?;
-    let mut message = prompt::clean_commit_message(&raw_message);
-    prompt::validate_commit_message(&message, cfg)
-        .context("LLM returned an invalid commit message")?;
+    let (mut message, fallback_name) =
+        provider::generate_validated_message(cfg, &system_prompt, diff)?;
 
     if let Some(ref name) = fallback_name {
         println!(
@@ -331,11 +328,9 @@ fn generate_final_message(
             match review_message()? {
                 ReviewAction::Accept => break candidate,
                 ReviewAction::Regenerate => {
-                    let (new_raw, fb) = provider::call_llm_with_fallback(cfg, &system_prompt, diff)
-                        .context("LLM API call failed")?;
-                    message = prompt::clean_commit_message(&new_raw);
-                    prompt::validate_commit_message(&message, cfg)
-                        .context("LLM regeneration returned an invalid commit message")?;
+                    let (new_message, fb) =
+                        provider::generate_validated_message(cfg, &system_prompt, diff)?;
+                    message = new_message;
                     if let Some(ref name) = fb {
                         println!(
                             "  {} Used fallback preset: {}",

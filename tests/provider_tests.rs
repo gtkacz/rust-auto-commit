@@ -434,6 +434,66 @@ fn call_llm_lm_studio_provider() {
 }
 
 #[test]
+fn generate_validated_message_retries_with_validator_feedback() {
+    let mut server = Server::new();
+    // Exact-body match so this mock can never swallow the correction request
+    let initial_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [
+            { "role": "system", "content": "system" },
+            {
+                "role": "user",
+                "content": "<diff>\ndiff\n</diff>\n\nWrite the commit message for the staged changes in <diff>, following all rules you were given. Output only the raw commit message."
+            }
+        ],
+        "max_tokens": 512,
+        "temperature": 0,
+        "stream": false
+    });
+    let initial_mock = server
+        .mock("POST", "/generate")
+        .match_body(Matcher::Json(initial_body))
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":"not a conventional message"}}]}"#)
+        .expect(1)
+        .create();
+    let correction_mock = server
+        .mock("POST", "/generate")
+        .match_body(Matcher::Regex("previous_attempt".into()))
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":"fix: corrected message"}}]}"#)
+        .expect(1)
+        .create();
+
+    let cfg = cfg_for("openai", format!("{}/generate", server.url()));
+    let (message, fallback) =
+        provider::generate_validated_message(&cfg, "system", "diff").expect("generation");
+
+    assert_eq!(message, "fix: corrected message");
+    assert!(fallback.is_none());
+    initial_mock.assert();
+    correction_mock.assert();
+}
+
+#[test]
+fn generate_validated_message_fails_when_correction_is_also_invalid() {
+    let mut server = Server::new();
+    let mock = server
+        .mock("POST", "/generate")
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":"still not conventional"}}]}"#)
+        .expect(2)
+        .create();
+
+    let cfg = cfg_for("openai", format!("{}/generate", server.url()));
+    let error = provider::generate_validated_message(&cfg, "system", "diff")
+        .expect_err("both attempts invalid");
+
+    assert!(error.to_string().contains("corrective retry"));
+    mock.assert();
+}
+
+#[test]
 fn call_llm_groq_provider() {
     let mut server = Server::new();
     let mock = server

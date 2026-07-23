@@ -190,7 +190,7 @@ impl std::fmt::Display for LlmCallError {
 fn call_llm_inner(
     cfg: &AppConfig,
     system_prompt: &str,
-    diff: &str,
+    user_prompt: &str,
     deadline: Instant,
 ) -> Result<String, LlmCallError> {
     let (url, headers_raw, format, response_path) =
@@ -199,7 +199,7 @@ fn call_llm_inner(
     let url = interpolate(&url, cfg).map_err(LlmCallError::Other)?;
     let headers_raw = interpolate(&headers_raw, cfg).map_err(LlmCallError::Other)?;
 
-    let body = build_request_body(format, &cfg.model, system_prompt, diff);
+    let body = build_request_body(format, &cfg.model, system_prompt, user_prompt);
     let headers = parse_headers(&headers_raw).map_err(LlmCallError::Other)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -274,10 +274,10 @@ fn call_llm_inner(
 pub fn call_llm_with_fallback(
     cfg: &AppConfig,
     system_prompt: &str,
-    diff: &str,
+    user_prompt: &str,
 ) -> Result<(String, Option<String>)> {
     let deadline = Instant::now() + TOTAL_REQUEST_TIMEOUT;
-    match call_llm_inner(cfg, system_prompt, diff, deadline) {
+    match call_llm_inner(cfg, system_prompt, user_prompt, deadline) {
         Ok(msg) => Ok((msg, None)),
         Err(primary_error) => {
             if !cfg.fallback_enabled || !primary_error.is_retryable() {
@@ -319,7 +319,7 @@ pub fn call_llm_with_fallback(
                 let mut temp_cfg = cfg.clone();
                 crate::preset::apply_preset_to_config(&mut temp_cfg, preset);
 
-                match call_llm_inner(&temp_cfg, system_prompt, diff, deadline) {
+                match call_llm_inner(&temp_cfg, system_prompt, user_prompt, deadline) {
                     Ok(msg) => return Ok((msg, Some(preset.name.clone()))),
                     Err(error) => {
                         let retryable = error.is_retryable();
@@ -338,9 +338,40 @@ pub fn call_llm_with_fallback(
 }
 
 /// Call the LLM API and return the generated commit message
-pub fn call_llm(cfg: &AppConfig, system_prompt: &str, diff: &str) -> Result<String> {
-    let (msg, _) = call_llm_with_fallback(cfg, system_prompt, diff)?;
+pub fn call_llm(cfg: &AppConfig, system_prompt: &str, user_prompt: &str) -> Result<String> {
+    let (msg, _) = call_llm_with_fallback(cfg, system_prompt, user_prompt)?;
     Ok(msg)
+}
+
+/// Generate a commit message for the staged diff and validate it, feeding the
+/// validator error back to the model for one corrective retry before giving up.
+/// Returns (message, fallback_preset_name_if_used).
+pub fn generate_validated_message(
+    cfg: &AppConfig,
+    system_prompt: &str,
+    diff: &str,
+) -> Result<(String, Option<String>)> {
+    let user_prompt = crate::prompt::build_user_prompt(diff);
+    let (raw, fallback) =
+        call_llm_with_fallback(cfg, system_prompt, &user_prompt).context("LLM API call failed")?;
+    let message = crate::prompt::clean_commit_message(&raw);
+    let error = match crate::prompt::validate_commit_message(&message, cfg) {
+        Ok(()) => return Ok((message, fallback)),
+        Err(error) => error,
+    };
+
+    println!(
+        "  {} LLM message failed validation ({error}); requesting a correction",
+        "note:".yellow().bold()
+    );
+    let correction_prompt =
+        crate::prompt::build_correction_prompt(diff, &message, &error.to_string());
+    let (raw, fallback) = call_llm_with_fallback(cfg, system_prompt, &correction_prompt)
+        .context("LLM API call failed")?;
+    let message = crate::prompt::clean_commit_message(&raw);
+    crate::prompt::validate_commit_message(&message, cfg)
+        .context("LLM returned an invalid commit message even after a corrective retry")?;
+    Ok((message, fallback))
 }
 
 fn resolve_provider(cfg: &AppConfig) -> Result<(String, String, RequestFormat, String)> {
@@ -378,7 +409,7 @@ fn build_request_body(
     format: RequestFormat,
     model: &str,
     system_prompt: &str,
-    diff: &str,
+    user_prompt: &str,
 ) -> Value {
     match format {
         RequestFormat::Gemini => {
@@ -388,7 +419,7 @@ fn build_request_body(
                 },
                 "contents": [{
                     "role": "user",
-                    "parts": [{ "text": diff }]
+                    "parts": [{ "text": user_prompt }]
                 }],
                 "generationConfig": {
                     "temperature": 0
@@ -400,7 +431,7 @@ fn build_request_body(
                 "model": model,
                 "messages": [
                     { "role": "system", "content": system_prompt },
-                    { "role": "user", "content": diff }
+                    { "role": "user", "content": user_prompt }
                 ],
                 "max_tokens": 512,
                 "temperature": 0,
@@ -412,9 +443,10 @@ fn build_request_body(
                 "model": model,
                 "system": system_prompt,
                 "messages": [
-                    { "role": "user", "content": diff }
+                    { "role": "user", "content": user_prompt }
                 ],
                 "max_tokens": 512,
+                "temperature": 0,
                 "stream": false
             })
         }
@@ -422,7 +454,7 @@ fn build_request_body(
             serde_json::json!({
                 "model": model,
                 "system_prompt": system_prompt,
-                "input": diff
+                "input": user_prompt
             })
         }
     }
@@ -721,6 +753,7 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "user diff");
         assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["temperature"], 0);
     }
 
     #[test]

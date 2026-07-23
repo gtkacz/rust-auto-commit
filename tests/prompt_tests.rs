@@ -1,16 +1,22 @@
 use auto_commit_rs::config::AppConfig;
-use auto_commit_rs::prompt::{build_system_prompt, clean_commit_message, validate_commit_message};
+use auto_commit_rs::prompt::{
+    build_correction_prompt, build_system_prompt, build_user_prompt, clean_commit_message,
+    validate_commit_message,
+};
 
 #[test]
 fn prompt_includes_core_sections_by_default() {
     let cfg = AppConfig::default();
     let prompt = build_system_prompt(&cfg);
 
+    assert!(prompt.contains("inside a <diff> block"));
     assert!(prompt.contains("following the Conventional Commits specification"));
-    assert!(prompt.contains("Output ONLY a single-line commit message"));
+    assert!(prompt.contains("Output exactly one line"));
     assert!(prompt.contains("Output only the raw commit message"));
+    assert!(prompt.contains("imperative mood"));
+    assert!(prompt.contains("never fabricate issue numbers"));
     assert!(!prompt.contains("Use Gitmoji"));
-    assert!(!prompt.contains("locale."));
+    assert!(!prompt.contains("' language"));
 }
 
 #[test]
@@ -38,8 +44,9 @@ fn prompt_includes_shortcode_gitmoji_and_locale_when_configured() {
 
     let prompt = build_system_prompt(&cfg);
     assert!(prompt.contains("relevant emoji in :shortcode: format"));
-    assert!(prompt.contains("Write the commit message in the 'pl' locale."));
-    assert!(!prompt.contains("Output ONLY a single-line commit message"));
+    assert!(prompt.contains("in the 'pl' language"));
+    assert!(prompt.contains("standard English form"));
+    assert!(!prompt.contains("Output exactly one line"));
 }
 
 #[test]
@@ -67,6 +74,109 @@ fn prompt_uses_custom_base_prompt() {
 
     let prompt = build_system_prompt(&cfg);
     assert!(prompt.starts_with("custom base prompt"));
+}
+
+#[test]
+fn prompt_examples_match_output_mode() {
+    let one_liner = build_system_prompt(&AppConfig::default());
+    assert!(one_liner.contains("<examples>"));
+    assert!(one_liner.contains("refactor!: replace callback API with async traits"));
+    assert!(!one_liner.contains("prevent redirect loop after login"));
+
+    let full = build_system_prompt(&AppConfig {
+        one_liner: false,
+        ..Default::default()
+    });
+    assert!(full.contains("fix(auth): prevent redirect loop after login"));
+    assert!(!full.contains("TTL-based eviction"));
+
+    let gitmoji = build_system_prompt(&AppConfig {
+        use_gitmoji: true,
+        ..Default::default()
+    });
+    assert!(!gitmoji.contains("TTL-based eviction"));
+    assert!(gitmoji.contains("<examples>"));
+}
+
+#[test]
+fn blank_base_prompt_resolves_to_built_in_default() {
+    let cfg = AppConfig {
+        llm_system_prompt: "  ".into(),
+        ..Default::default()
+    };
+
+    let prompt = build_system_prompt(&cfg);
+    assert!(prompt.starts_with("You are an expert software engineer"));
+}
+
+#[test]
+fn legacy_default_base_prompts_resolve_to_built_in_default() {
+    // Every default shipped before blank-means-default existed, verbatim as it
+    // was persisted into user config files by those versions
+    let legacy_defaults = [
+        "You are to act as an author of a commit message in git. \
+         I'll send you an output of 'git diff --staged' command, and you are to convert \
+         it into a commit message. Follow the Conventional Commits specification.",
+        "You are to act as an author of a commit message in git.\n\
+         Your mission is to create clean and comprehensive commit messages as per\n\
+         the Conventional Commit specification and explain WHAT were the changes and mainly WHY the changes were done.\n\
+         I'll send you an output of 'git diff --staged' command, and you are to convert\n\
+         it into a commit message. Use the present tense.",
+        "You are to act as an author of a commit message in git.\n\
+         Your mission is to create clean and comprehensive commit messages as per\n\
+         the Conventional Commit specification and explain WHAT were the changes and mainly WHY the changes were done.\n\
+         I'll send you an output of 'git diff --staged' command, and you are to convert\n\
+         it into a commit message. Use the present tense.\n\
+         Lines must not be longer than 80 characters. Use english for the commit message.",
+        "You are to act as an author of a commit message in git.\n\
+         Your mission is to create clean and comprehensive commit messages as per\n\
+         the Conventional Commit specification and explain WHAT were the changes and mainly WHY the changes were done.\n\
+         I'll send you an output of 'git diff --staged' command, and you are to convert\n\
+         it into a commit message. Use the present tense. Use english for the commit message.",
+    ];
+
+    for legacy in legacy_defaults {
+        let cfg = AppConfig {
+            llm_system_prompt: legacy.into(),
+            ..Default::default()
+        };
+
+        let prompt = build_system_prompt(&cfg);
+        assert!(
+            prompt.starts_with("You are an expert software engineer"),
+            "legacy default was not upgraded: {legacy}"
+        );
+        assert!(!prompt.contains("act as an author"));
+    }
+}
+
+#[test]
+fn correction_prompt_shows_attempt_and_error_then_restates_task() {
+    let prompt = build_correction_prompt(
+        "diff --git a/x b/x",
+        "a bad message",
+        "Commit message must start with a Conventional Commit header",
+    );
+
+    assert!(prompt.starts_with("<diff>\ndiff --git a/x b/x\n</diff>"));
+    assert!(prompt.contains("<previous_attempt>\na bad message\n</previous_attempt>"));
+    assert!(prompt.contains(
+        "<error>\nCommit message must start with a Conventional Commit header\n</error>"
+    ));
+    let task = prompt.rfind("Output only the raw commit message").unwrap();
+    assert!(task > prompt.rfind("</error>").unwrap());
+}
+
+#[test]
+fn user_prompt_wraps_diff_and_restates_task_after_it() {
+    let user_prompt = build_user_prompt("diff --git a/x b/x\n+line");
+
+    assert!(user_prompt.starts_with("<diff>\ndiff --git a/x b/x\n+line\n</diff>"));
+    let diff_end = user_prompt.find("</diff>").unwrap();
+    let instruction = user_prompt
+        .find("Output only the raw commit message")
+        .unwrap();
+    assert!(instruction > diff_end);
 }
 
 #[test]
