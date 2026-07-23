@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use auto_commit_rs::{cache, cli, config, git, preset, prompt, provider, ui, update};
+use auto_commit_rs::{
+    cache, cli, config, editor, git, preset, prompt, provider, ui, update, workflow,
+};
 use colored::Colorize;
 use inquire::Select;
 use std::time::Instant;
@@ -120,6 +122,13 @@ fn run_standard_commit(cfg: &config::AppConfig, cli: &cli::Cli) -> Result<()> {
         .collect();
     let diff = git::get_staged_diff_filtered(&cli.diff_include, &excludes)
         .context("Failed to get staged diff")?;
+    workflow::enforce_diff_safety(
+        cfg,
+        &diff,
+        &staged_files,
+        cli.allow_large_diff,
+        cli.allow_sensitive,
+    )?;
     let Some((final_msg, time_to_ready)) =
         generate_final_message(cfg, &diff, cli.verbose, gen_start)?
     else {
@@ -155,18 +164,20 @@ fn run_standard_commit(cfg: &config::AppConfig, cli: &cli::Cli) -> Result<()> {
         }
     }
 
-    if cli.tag {
-        create_semver_tag(cfg)?;
-    }
+    let created_tag = if cli.tag {
+        create_semver_tag(cfg)?
+    } else {
+        None
+    };
 
-    handle_post_commit_push(cfg, "Commit created. Push now?")?;
+    handle_post_commit_push(cfg, "Commit created. Push now?", created_tag.as_deref())?;
     Ok(())
 }
 
 fn run_alter(cfg: &config::AppConfig, cli: &cli::Cli, commits: &[String]) -> Result<()> {
     ensure_api_key(cfg)?;
 
-    let (target, diff) = match commits {
+    let (target, raw_diff) = match commits {
         [single] => (
             single.to_string(),
             git::get_commit_diff(single).context("Failed to get commit diff")?,
@@ -177,8 +188,23 @@ fn run_alter(cfg: &config::AppConfig, cli: &cli::Cli, commits: &[String]) -> Res
         ),
         _ => anyhow::bail!("Expected one or two commit hashes."),
     };
+    let all_files = git::diff_paths(&raw_diff)?;
+    let excludes: Vec<String> = cfg
+        .diff_exclude_globs
+        .iter()
+        .chain(cli.diff_exclude.iter())
+        .cloned()
+        .collect();
+    let diff = git::filter_diff_by_globs(&raw_diff, &cli.diff_include, &excludes)
+        .context("Failed to filter commit diff")?;
+    workflow::enforce_diff_safety(
+        cfg,
+        &diff,
+        &all_files,
+        cli.allow_large_diff,
+        cli.allow_sensitive,
+    )?;
 
-    let target_is_head = git::is_head_commit(&target)?;
     let target_is_pushed = git::commit_is_pushed(&target)?;
     if target_is_pushed {
         let proceed = ui::confirm(
@@ -217,33 +243,24 @@ fn run_alter(cfg: &config::AppConfig, cli: &cli::Cli, commits: &[String]) -> Res
         return Ok(());
     }
 
-    git::rewrite_commit_message(&target, &final_msg, cfg.suppress_tool_output)
+    let rewritten_hash = git::rewrite_commit_message(&target, &final_msg, cfg.suppress_tool_output)
         .context("Failed to rewrite commit message")?;
 
     if cfg.track_generated_commits {
         if let Ok(repo_root) = git::find_repo_root() {
-            if let Ok(hash) = cache::get_head_hash() {
-                let preview: String = final_msg.chars().take(80).collect();
-                let _ = cache::record_commit(&repo_root, &hash, &preview);
-            }
+            let preview: String = final_msg.chars().take(80).collect();
+            let _ = cache::record_commit(&repo_root, &rewritten_hash, &preview);
         }
     }
 
     if target_is_pushed {
         let should_push = ui::confirm(
-            "History was rewritten on a pushed commit. Attempt `git push` now?",
+            "History was rewritten on a pushed commit. Run `git push --force-with-lease` now?",
             false,
         );
         if should_push {
-            if !target_is_head {
-                println!(
-                    "{}",
-                    "Note: a non-HEAD rewrite may require `git push --force-with-lease`."
-                        .yellow()
-                        .bold()
-                );
-            }
-            git::run_push(cfg.suppress_tool_output).context("git push failed")?;
+            git::run_force_push_with_lease(cfg.suppress_tool_output)
+                .context("force-with-lease push failed; rewritten history remains local")?;
         } else {
             println!(
                 "{}",
@@ -251,7 +268,7 @@ fn run_alter(cfg: &config::AppConfig, cli: &cli::Cli, commits: &[String]) -> Res
             );
         }
     } else {
-        handle_post_commit_push(cfg, "Commit message altered. Push now?")?;
+        handle_post_commit_push(cfg, "Commit message altered. Push now?", None)?;
     }
 
     Ok(())
@@ -282,13 +299,8 @@ fn generate_final_message(
     let (raw_message, fallback_name) = provider::call_llm_with_fallback(cfg, &system_prompt, diff)
         .context("LLM API call failed")?;
     let mut message = prompt::clean_commit_message(&raw_message);
-
-    if message.is_empty() {
-        anyhow::bail!(
-            "LLM returned a message that was empty after cleaning. Raw response: {:?}",
-            raw_message
-        );
-    }
+    prompt::validate_commit_message(&message, cfg)
+        .context("LLM returned an invalid commit message")?;
 
     if let Some(ref name) = fallback_name {
         println!(
@@ -307,6 +319,8 @@ fn generate_final_message(
                 .replace("$msg", message.trim())
                 .trim()
                 .to_string();
+            prompt::validate_commit_message(&candidate, cfg)
+                .context("Commit template produced an invalid commit message")?;
 
             if time_to_ready.is_none() {
                 time_to_ready = Some(gen_start.elapsed());
@@ -320,6 +334,8 @@ fn generate_final_message(
                     let (new_raw, fb) = provider::call_llm_with_fallback(cfg, &system_prompt, diff)
                         .context("LLM API call failed")?;
                     message = prompt::clean_commit_message(&new_raw);
+                    prompt::validate_commit_message(&message, cfg)
+                        .context("LLM regeneration returned an invalid commit message")?;
                     if let Some(ref name) = fb {
                         println!(
                             "  {} Used fallback preset: {}",
@@ -329,8 +345,15 @@ fn generate_final_message(
                     }
                 }
                 ReviewAction::Edit => {
-                    let edited = edit::edit(&candidate)?;
-                    break edited.trim().to_string();
+                    let edited = editor::edit(&candidate)?;
+                    let edited = edited.trim().to_string();
+                    match prompt::validate_commit_message(&edited, cfg) {
+                        Ok(()) => break edited,
+                        Err(error) => {
+                            println!("  {} {}", "invalid message:".red().bold(), error);
+                            continue;
+                        }
+                    }
                 }
                 ReviewAction::Cancel => {
                     println!("{}", "Commit cancelled.".dimmed());
@@ -344,6 +367,8 @@ fn generate_final_message(
             .replace("$msg", message.trim())
             .trim()
             .to_string();
+        prompt::validate_commit_message(&final_msg, cfg)
+            .context("Commit template produced an invalid commit message")?;
         time_to_ready = Some(gen_start.elapsed());
         println!("\n{} {}", "Commit message:".green().bold(), final_msg);
         final_msg
@@ -352,7 +377,7 @@ fn generate_final_message(
     Ok(Some((final_msg, time_to_ready)))
 }
 
-fn create_semver_tag(cfg: &config::AppConfig) -> Result<()> {
+fn create_semver_tag(cfg: &config::AppConfig) -> Result<Option<String>> {
     let latest = git::get_latest_tag().context("Failed to inspect existing tags")?;
     let next_tag = git::compute_next_minor_tag(latest.as_deref())?;
 
@@ -368,12 +393,12 @@ fn create_semver_tag(cfg: &config::AppConfig) -> Result<()> {
 
     if !should_create {
         println!("{}", "Tag creation skipped.".dimmed());
-        return Ok(());
+        return Ok(None);
     }
 
     git::create_tag(&next_tag, cfg.suppress_tool_output).context("Failed to create git tag")?;
     println!("{} {}", "Created tag:".green().bold(), next_tag);
-    Ok(())
+    Ok(Some(next_tag))
 }
 
 enum ReviewAction {
@@ -418,18 +443,26 @@ fn print_staged_files(staged_files: &[String]) {
     }
 }
 
-fn handle_post_commit_push(cfg: &config::AppConfig, ask_prompt: &str) -> Result<()> {
-    match cfg.post_commit_push.as_str() {
-        "never" => {}
-        "always" => {
-            git::run_push(cfg.suppress_tool_output).context("git push failed")?;
+fn handle_post_commit_push(
+    cfg: &config::AppConfig,
+    ask_prompt: &str,
+    created_tag: Option<&str>,
+) -> Result<()> {
+    let should_push = match cfg.post_commit_push.as_str() {
+        "never" => false,
+        "always" => true,
+        _ => ui::confirm(ask_prompt, true),
+    };
+    if should_push {
+        git::run_push(cfg.suppress_tool_output).context("git push failed")?;
+        if let Some(tag) = created_tag {
+            git::push_tag(tag, cfg.suppress_tool_output)?;
         }
-        _ => {
-            let should_push = ui::confirm(ask_prompt, true);
-            if should_push {
-                git::run_push(cfg.suppress_tool_output).context("git push failed")?;
-            }
-        }
+    } else if let Some(tag) = created_tag {
+        println!(
+            "{}",
+            format!("Tag '{tag}' remains local until it is pushed.").dimmed()
+        );
     }
     Ok(())
 }
@@ -473,7 +506,7 @@ fn check_for_updates(cfg: Option<&config::AppConfig>) -> Option<String> {
             version_check.current.dimmed(),
             version_check.latest.green(),
         );
-        if let Err(e) = update::run_update() {
+        if let Err(e) = update::run_update(&version_check.latest) {
             eprintln!("{} Auto-update failed: {}", "warning:".yellow().bold(), e);
             return Some(version_check.latest);
         }
@@ -520,7 +553,7 @@ fn run_update_command() -> Result<()> {
                 v.current.dimmed(),
                 v.latest.green(),
             );
-            update::run_update()?;
+            update::run_update(&v.latest)?;
         }
         Ok(v) => {
             println!(

@@ -1,10 +1,13 @@
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod editor;
 pub mod git;
 pub mod interpolation;
+pub mod persistence;
 pub mod preset;
 pub mod prompt;
 pub mod provider;
 pub mod ui;
 pub mod update;
+pub mod workflow;

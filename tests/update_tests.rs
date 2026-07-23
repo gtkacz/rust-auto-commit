@@ -35,8 +35,8 @@ fn semver_comparison_works_for_update_detection() {
     assert!(newer_patch > current);
     assert!(newer_minor > current);
     assert!(newer_major > current);
-    assert!(!(same > current));
-    assert!(!(older > current));
+    assert!(same <= current);
+    assert!(older <= current);
 }
 
 #[test]

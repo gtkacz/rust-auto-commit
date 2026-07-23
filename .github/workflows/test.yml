@@ -7,27 +7,63 @@ on:
     branches: [main]
 
 jobs:
-  test-and-coverage:
+  quality:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: llvm-tools-preview
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Run test suite
-        run: cargo test --locked
-
-      - name: Enforce core logic coverage %
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Strict Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Enforce documented core-logic coverage
         run: >
           cargo llvm-cov --locked --lib --tests
           --ignore-filename-regex '(main|cli|preset|update|cache|ui)\.rs'
           --summary-only
           --fail-under-lines 90
+      - name: Validate Unix installer
+        run: shellcheck scripts/install.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run test suite
+        run: cargo test --locked
+      - name: Parse PowerShell installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1),
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) { throw ($errors | Out-String) }
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.74"
+      - run: cargo check --locked --all-targets
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

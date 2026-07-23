@@ -66,5 +66,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.decide.outputs.version }}
         run: |
-          gh workflow run release.yml --ref "$VERSION"
+          gh workflow run release.yml --ref "$VERSION" -f tag="$VERSION"
           echo "Dispatched release.yml at tag $VERSION"

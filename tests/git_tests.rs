@@ -129,12 +129,13 @@ fn rewrite_head_commit_message_amends_commit() {
     let repo = common::init_git_repo();
     let _cwd = DirGuard::enter(repo.path());
     let original = commit_file(repo.path(), "msg.txt", "v1", "feat: old");
-    git::rewrite_commit_message("HEAD", "feat: new", true).expect("rewrite head");
+    let returned = git::rewrite_commit_message("HEAD", "feat: new", true).expect("rewrite head");
     let current = git_stdout(repo.path(), ["log", "-1", "--pretty=%s"]);
     let rewritten = git_stdout(repo.path(), ["rev-parse", "HEAD"]);
 
     assert_eq!(current, "feat: new");
     assert_ne!(rewritten, original);
+    assert_eq!(returned, rewritten);
 }
 
 #[test]
@@ -210,16 +211,68 @@ fn reword_non_head_commit_works() {
     // git::rewrite_commit_message handles HEAD (amend) and non-HEAD (rebase).
     // It calls reword_non_head_commit for c2.
 
-    git::rewrite_commit_message(&c2, "new message", true).expect("rewrite should succeed");
+    let returned =
+        git::rewrite_commit_message(&c2, "new message", true).expect("rewrite should succeed");
 
     // Verify c2 message is changed.
     // Since history changed, we look at HEAD~1
     let msg = git_stdout(repo.path(), ["log", "-1", "--pretty=%s", "HEAD~1"]);
     assert_eq!(msg, "new message");
+    assert_eq!(returned, git_stdout(repo.path(), ["rev-parse", "HEAD~1"]));
 
     // Verify content is still there (c3 content at HEAD)
     let content = std::fs::read_to_string(repo.path().join("a.txt")).expect("read file");
     assert_eq!(content, "3");
+}
+
+#[test]
+#[serial]
+fn undo_root_commit_keeps_changes_staged() {
+    let repo = common::init_git_repo();
+    let _cwd = DirGuard::enter(repo.path());
+    commit_file(repo.path(), "root.txt", "root", "root commit");
+
+    git::undo_last_commit_soft(true).unwrap();
+    assert!(git::ensure_head_exists().is_err());
+    assert_eq!(
+        git_stdout(repo.path(), ["diff", "--cached", "--name-only"]),
+        "root.txt"
+    );
+}
+
+#[test]
+#[serial]
+fn rewriting_root_commit_returns_new_root_identity() {
+    let repo = common::init_git_repo();
+    let _cwd = DirGuard::enter(repo.path());
+    let root = commit_file(repo.path(), "root.txt", "root", "root");
+    commit_file(repo.path(), "next.txt", "next", "next");
+
+    let rewritten = git::rewrite_commit_message(&root, "new root", true).unwrap();
+    assert_eq!(rewritten, git_stdout(repo.path(), ["rev-parse", "HEAD~1"]));
+    assert_eq!(
+        git_stdout(repo.path(), ["log", "-1", "--pretty=%s", &rewritten]),
+        "new root"
+    );
+}
+
+#[test]
+#[serial]
+fn push_tag_publishes_created_tag() {
+    let repo = common::init_git_repo();
+    let remote = tempfile::TempDir::new().unwrap();
+    git_ok(remote.path(), ["init", "--bare"]);
+    let remote_url = remote.path().to_string_lossy().replace('\\', "/");
+    git_ok(repo.path(), ["remote", "add", "origin", &remote_url]);
+    let _cwd = DirGuard::enter(repo.path());
+    commit_file(repo.path(), "a.txt", "a", "first");
+    git_ok(repo.path(), ["push", "-u", "origin", "HEAD"]);
+    git::create_tag("1.0.0", true).unwrap();
+    git::push_tag("1.0.0", true).unwrap();
+    assert_eq!(
+        git_stdout(remote.path(), ["tag", "--list", "1.0.0"]),
+        "1.0.0"
+    );
 }
 
 #[test]
@@ -251,7 +304,7 @@ index ccccccc..ddddddd 100644
 
     // Exclude *.json and *.csv
     let patterns = vec!["*.json".to_string(), "*.csv".to_string()];
-    let filtered = git::filter_diff_by_globs(diff, &[], &patterns);
+    let filtered = git::filter_diff_by_globs(diff, &[], &patterns).unwrap();
 
     // Should contain main.rs changes
     assert!(filtered.contains("src/main.rs"));
@@ -265,7 +318,7 @@ index ccccccc..ddddddd 100644
 #[test]
 fn filter_diff_by_globs_returns_full_diff_when_no_patterns() {
     let diff = "diff --git a/foo.json b/foo.json\n+test\n";
-    let filtered = git::filter_diff_by_globs(diff, &[], &[]);
+    let filtered = git::filter_diff_by_globs(diff, &[], &[]).unwrap();
     assert_eq!(filtered, diff);
 }
 
@@ -284,7 +337,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 "#;
 
     let patterns = vec!["*.json".to_string()];
-    let filtered = git::filter_diff_by_globs(diff, &[], &patterns);
+    let filtered = git::filter_diff_by_globs(diff, &[], &patterns).unwrap();
 
     // Should contain lib.rs but not the nested json file
     assert!(filtered.contains("src/lib.rs"));
@@ -292,13 +345,11 @@ diff --git a/src/lib.rs b/src/lib.rs
 }
 
 #[test]
-fn filter_diff_by_globs_invalid_pattern_ignored() {
+fn filter_diff_by_globs_invalid_pattern_is_rejected() {
     let diff = "diff --git a/test.rs b/test.rs\n+code\n";
-    // Invalid glob pattern should be silently ignored
     let patterns = vec!["[invalid".to_string(), "*.rs".to_string()];
-    let filtered = git::filter_diff_by_globs(diff, &[], &patterns);
-    // Since *.rs matches, the diff should be filtered out
-    assert!(!filtered.contains("test.rs"));
+    let error = git::filter_diff_by_globs(diff, &[], &patterns).unwrap_err();
+    assert!(error.to_string().contains("Invalid diff glob"));
 }
 
 #[test]
@@ -321,7 +372,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 "#;
 
     let patterns = vec!["*.lock".to_string()];
-    let filtered = git::filter_diff_by_globs(diff, &[], &patterns);
+    let filtered = git::filter_diff_by_globs(diff, &[], &patterns).unwrap();
 
     // Should keep .rs files, exclude .lock
     assert!(filtered.contains("main.rs"));

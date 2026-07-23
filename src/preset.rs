@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
-use inquire::{Select, Text};
+use inquire::{Password, Select, Text};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -35,6 +35,8 @@ pub struct FallbackConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PresetsFile {
     #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
     pub next_id: u32,
     #[serde(default)]
     pub presets: Vec<Preset>,
@@ -60,25 +62,67 @@ pub fn load_presets() -> Result<PresetsFile> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let file: PresetsFile =
+    let mut file: PresetsFile =
         toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
+    repair_next_id(&mut file);
     Ok(file)
 }
 
-pub fn save_presets(file: &PresetsFile) -> Result<()> {
+pub fn save_presets(file: &mut PresetsFile) -> Result<()> {
     let path = presets_file_path().context("Could not determine presets file path")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    crate::persistence::with_file_lock(&path, || {
+        let disk_revision = load_presets_unlocked(&path)?.revision;
+        if disk_revision != file.revision {
+            anyhow::bail!(
+                "Presets changed in another process; reload before saving (disk revision {}, loaded revision {})",
+                disk_revision,
+                file.revision
+            );
+        }
+        repair_next_id(file);
+        file.revision = file.revision.saturating_add(1);
+        write_presets_unlocked(&path, file)
+    })
+}
+
+pub fn update_presets<T>(action: impl FnOnce(&mut PresetsFile) -> Result<T>) -> Result<T> {
+    let path = presets_file_path().context("Could not determine presets file path")?;
+    crate::persistence::with_file_lock(&path, || {
+        let mut file = load_presets_unlocked(&path)?;
+        let result = action(&mut file)?;
+        repair_next_id(&mut file);
+        file.revision = file.revision.saturating_add(1);
+        write_presets_unlocked(&path, &file)?;
+        Ok(result)
+    })
+}
+
+fn load_presets_unlocked(path: &std::path::Path) -> Result<PresetsFile> {
+    if !path.exists() {
+        return Ok(PresetsFile::default());
     }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut file: PresetsFile =
+        toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
+    repair_next_id(&mut file);
+    Ok(file)
+}
+
+fn write_presets_unlocked(path: &std::path::Path, file: &PresetsFile) -> Result<()> {
     let content = toml::to_string_pretty(file).context("Failed to serialize presets")?;
-    // Write to temp file then rename for atomicity
-    let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, &content)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
-        .with_context(|| format!("Failed to rename temp file to {}", path.display()))?;
-    Ok(())
+    crate::persistence::atomic_write_unlocked(path, content.as_bytes())
+}
+
+fn repair_next_id(file: &mut PresetsFile) {
+    let after_largest = file
+        .presets
+        .iter()
+        .map(|preset| preset.id)
+        .max()
+        .map(|id| id.saturating_add(1))
+        .unwrap_or(0);
+    file.next_id = file.next_id.max(after_largest);
 }
 
 pub fn fields_from_config(cfg: &AppConfig) -> LlmPresetFields {
@@ -118,6 +162,7 @@ pub fn find_duplicate(file: &PresetsFile, fields: &LlmPresetFields) -> Option<u3
 }
 
 pub fn create_preset(file: &mut PresetsFile, name: Option<String>, fields: LlmPresetFields) -> u32 {
+    repair_next_id(file);
     let id = file.next_id;
     file.next_id += 1;
     let name = name.unwrap_or_else(|| format!("{}/{}", fields.provider, fields.model));
@@ -151,6 +196,7 @@ pub fn duplicate_preset(file: &mut PresetsFile, id: u32) -> Result<u32> {
 /// Export presets as standalone TOML. If `!include_keys`, api_key is replaced with "".
 pub fn export_presets(file: &PresetsFile, ids: &[u32], include_keys: bool) -> Result<String> {
     let mut export = PresetsFile {
+        revision: 0,
         next_id: 0,
         presets: Vec::new(),
         fallback: FallbackConfig::default(),
@@ -236,7 +282,7 @@ pub fn interactive_presets() -> Result<()> {
                     })
                     .prompt()
                     .unwrap_or_default();
-                let api_key = Text::new("API Key:").prompt().unwrap_or_default();
+                let api_key = Password::new("API Key:").prompt().unwrap_or_default();
                 let api_url = Text::new("API URL (blank for auto):")
                     .prompt()
                     .unwrap_or_default();
@@ -264,7 +310,7 @@ pub fn interactive_presets() -> Result<()> {
                     continue;
                 }
                 let id = create_preset(&mut file, name, fields);
-                save_presets(&file)?;
+                save_presets(&mut file)?;
                 println!("  {} Created preset [{}]", "done!".green().bold(), id);
             }
             "Manage existing preset..." => {
@@ -284,20 +330,20 @@ pub fn interactive_presets() -> Result<()> {
                     "Rename" => {
                         if let Ok(new_name) = Text::new("New name:").prompt() {
                             rename_preset(&mut file, selected_id, new_name);
-                            save_presets(&file)?;
+                            save_presets(&mut file)?;
                             println!("  {}", "Renamed.".green().bold());
                         }
                     }
                     "Duplicate" => {
                         let new_id = duplicate_preset(&mut file, selected_id)?;
-                        save_presets(&file)?;
+                        save_presets(&mut file)?;
                         println!("  {} Duplicated as [{}]", "done!".green().bold(), new_id);
                     }
                     "Delete" => {
                         let confirm = ui::confirm("Delete this preset?", false);
                         if confirm {
                             delete_preset(&mut file, selected_id);
-                            save_presets(&file)?;
+                            save_presets(&mut file)?;
                             println!("  {}", "Deleted.".green().bold());
                         }
                     }
@@ -330,7 +376,7 @@ pub fn interactive_presets() -> Result<()> {
                 }
                 match import_presets(&mut file, &data) {
                     Ok(count) => {
-                        save_presets(&file)?;
+                        save_presets(&mut file)?;
                         println!("  {} Imported {} preset(s)", "done!".green().bold(), count);
                     }
                     Err(e) => println!("  {} {}", "error:".red().bold(), e),
@@ -391,7 +437,7 @@ pub fn interactive_fallback_order() -> Result<()> {
                     let idx = options.iter().position(|o| o == &choice).unwrap();
                     let id = available[idx].id;
                     file.fallback.order.push(id);
-                    save_presets(&file)?;
+                    save_presets(&mut file)?;
                     println!("  {}", "Added.".green().bold());
                 }
             }
@@ -417,7 +463,7 @@ pub fn interactive_fallback_order() -> Result<()> {
                 {
                     let idx = options.iter().position(|o| o == &choice).unwrap();
                     file.fallback.order.remove(idx);
-                    save_presets(&file)?;
+                    save_presets(&mut file)?;
                     println!("  {}", "Removed.".green().bold());
                 }
             }
@@ -444,7 +490,7 @@ pub fn interactive_fallback_order() -> Result<()> {
                     let idx = options.iter().position(|o| o == &choice).unwrap();
                     if idx > 0 {
                         file.fallback.order.swap(idx, idx - 1);
-                        save_presets(&file)?;
+                        save_presets(&mut file)?;
                         println!("  {}", "Moved.".green().bold());
                     }
                 }
@@ -472,7 +518,7 @@ pub fn interactive_fallback_order() -> Result<()> {
                     let idx = options.iter().position(|o| o == &choice).unwrap();
                     if idx < file.fallback.order.len() - 1 {
                         file.fallback.order.swap(idx, idx + 1);
-                        save_presets(&file)?;
+                        save_presets(&mut file)?;
                         println!("  {}", "Moved.".green().bold());
                     }
                 }
@@ -481,7 +527,7 @@ pub fn interactive_fallback_order() -> Result<()> {
                 let confirm = ui::confirm("Clear entire fallback order?", false);
                 if confirm {
                     file.fallback.order.clear();
-                    save_presets(&file)?;
+                    save_presets(&mut file)?;
                     println!("  {}", "Cleared.".green().bold());
                 }
             }
@@ -536,7 +582,7 @@ pub fn save_current_as_preset(cfg: &AppConfig) -> Result<()> {
     let name = if name.is_empty() { None } else { Some(name) };
 
     let id = create_preset(&mut file, name, fields);
-    save_presets(&file)?;
+    save_presets(&mut file)?;
     println!("  {} Created preset [{}]", "done!".green().bold(), id);
     Ok(())
 }
@@ -556,7 +602,7 @@ pub fn prompt_update_preset(cfg: &AppConfig, preset_id: u32) -> Result<()> {
     let mut file = load_presets()?;
     if let Some(p) = file.presets.iter_mut().find(|p| p.id == preset_id) {
         p.fields = fields_from_config(cfg);
-        save_presets(&file)?;
+        save_presets(&mut file)?;
         println!("  {} Preset updated.", "done!".green().bold());
     }
     Ok(())

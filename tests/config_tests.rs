@@ -1,13 +1,15 @@
+#![allow(clippy::field_reassign_with_default)]
+
 mod common;
 
-use std::fs;
+use std::{collections::HashSet, fs};
 
 use auto_commit_rs::config::{field_description, global_config_path, AppConfig};
 use serial_test::serial;
 
 use crate::common::{DirGuard, EnvGuard, GlobalConfigGuard};
 
-fn acr_env_keys() -> [&'static str; 18] {
+fn acr_env_keys() -> [&'static str; 24] {
     [
         "ACR_CONFIG_HOME",
         "ACR_PROVIDER",
@@ -27,6 +29,12 @@ fn acr_env_keys() -> [&'static str; 18] {
         "ACR_WARN_STAGED_FILES_ENABLED",
         "ACR_WARN_STAGED_FILES_THRESHOLD",
         "ACR_CONFIRM_NEW_VERSION",
+        "ACR_AUTO_UPDATE",
+        "ACR_FALLBACK_ENABLED",
+        "ACR_TRACK_GENERATED_COMMITS",
+        "ACR_DIFF_EXCLUDE_GLOBS",
+        "ACR_MAX_DIFF_BYTES",
+        "ACR_SENSITIVE_FILE_GLOBS",
     ]
 }
 
@@ -109,15 +117,15 @@ ACR_PROVIDER=anthropic
 ACR_MODEL=claude-local
 ACR_POST_COMMIT_PUSH=never
 ACR_WARN_STAGED_FILES_THRESHOLD=13
-ACR_API_HEADERS='X-Foo: bar'
+ACR_API_HEADERS='{"X-Foo":"bar"}'
 "#,
     )
     .expect("write local env");
 
     let _env_overrides = EnvGuard::set(&[
         ("ACR_MODEL", "env-model"),
-        ("ACR_POST_COMMIT_PUSH", "invalid-value"),
-        ("ACR_WARN_STAGED_FILES_THRESHOLD", "not-a-number"),
+        ("ACR_POST_COMMIT_PUSH", "ask"),
+        ("ACR_WARN_STAGED_FILES_THRESHOLD", "21"),
         ("ACR_USE_GITMOJI", "true"),
     ]);
 
@@ -125,9 +133,9 @@ ACR_API_HEADERS='X-Foo: bar'
     assert_eq!(cfg.provider, "anthropic");
     assert_eq!(cfg.model, "env-model");
     assert_eq!(cfg.post_commit_push, "ask");
-    assert_eq!(cfg.warn_staged_files_threshold, 20);
+    assert_eq!(cfg.warn_staged_files_threshold, 21);
     assert!(cfg.use_gitmoji);
-    assert_eq!(cfg.api_headers, "X-Foo: bar");
+    assert_eq!(cfg.api_headers, r#"{"X-Foo":"bar"}"#);
 }
 
 #[test]
@@ -140,7 +148,7 @@ fn save_local_writes_normalized_env_file() {
     cfg.model = "gemini-2.0-flash".into();
     cfg.api_key = "secret-key-value".into();
     cfg.locale = "pl".into();
-    cfg.post_commit_push = "unexpected".into();
+    cfg.post_commit_push = "ask".into();
     cfg.warn_staged_files_enabled = false;
     cfg.warn_staged_files_threshold = 42;
     cfg.confirm_new_version = false;
@@ -148,13 +156,83 @@ fn save_local_writes_normalized_env_file() {
     cfg.save_local().expect("save local config");
 
     let env_content = fs::read_to_string(repo.path().join(".env")).expect("read .env");
-    assert!(env_content.contains("ACR_PROVIDER=gemini"));
-    assert!(env_content.contains("ACR_MODEL=gemini-2.0-flash"));
-    assert!(env_content.contains("ACR_API_KEY=secret-key-value"));
-    assert!(env_content.contains("ACR_POST_COMMIT_PUSH=ask"));
-    assert!(env_content.contains("ACR_WARN_STAGED_FILES_ENABLED=0"));
-    assert!(env_content.contains("ACR_WARN_STAGED_FILES_THRESHOLD=42"));
-    assert!(env_content.contains("ACR_CONFIRM_NEW_VERSION=0"));
+    assert!(env_content.contains("ACR_PROVIDER=\"gemini\""));
+    assert!(env_content.contains("ACR_MODEL=\"gemini-2.0-flash\""));
+    assert!(env_content.contains("ACR_API_KEY=\"secret-key-value\""));
+    assert!(env_content.contains("ACR_POST_COMMIT_PUSH=\"ask\""));
+    assert!(env_content.contains("ACR_WARN_STAGED_FILES_ENABLED=\"0\""));
+    assert!(env_content.contains("ACR_WARN_STAGED_FILES_THRESHOLD=\"42\""));
+    assert!(env_content.contains("ACR_CONFIRM_NEW_VERSION=\"0\""));
+}
+
+#[test]
+#[serial]
+fn partial_global_config_retains_runtime_defaults() {
+    let repo = common::init_git_repo();
+    let _cwd = DirGuard::enter(repo.path());
+    let cfg_dir = tempfile::TempDir::new().expect("tempdir");
+    let _acr = EnvGuard::clear(&acr_env_keys());
+    let _env = EnvGuard::set(&[("ACR_CONFIG_HOME", cfg_dir.path().to_string_lossy().as_ref())]);
+
+    let global_path = global_config_path().expect("global path");
+    fs::create_dir_all(global_path.parent().unwrap()).unwrap();
+    fs::write(&global_path, "provider = \"openai\"\n").unwrap();
+
+    let cfg = AppConfig::load().unwrap();
+    assert_eq!(cfg.provider, "openai");
+    assert!(cfg.review_commit, "omitted booleans must retain defaults");
+    assert!(cfg.one_liner);
+}
+
+#[test]
+#[serial]
+fn sparse_local_env_inherits_absent_global_values() {
+    let repo = common::init_git_repo();
+    let _cwd = DirGuard::enter(repo.path());
+    let cfg_dir = tempfile::TempDir::new().expect("tempdir");
+    let _acr = EnvGuard::clear(&acr_env_keys());
+    let _env = EnvGuard::set(&[("ACR_CONFIG_HOME", cfg_dir.path().to_string_lossy().as_ref())]);
+
+    let global_path = global_config_path().expect("global path");
+    fs::create_dir_all(global_path.parent().unwrap()).unwrap();
+    fs::write(
+        &global_path,
+        "provider = \"openai\"\nmodel = \"gpt-global\"\nlocale = \"pt-BR\"\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join(".env"), "ACR_API_KEY='local token'\n").unwrap();
+
+    let state = AppConfig::load_local_for_edit().unwrap();
+    assert_eq!(state.config.provider, "openai");
+    assert_eq!(state.config.model, "gpt-global");
+    assert_eq!(state.config.locale, "pt-br");
+    assert_eq!(state.config.api_key, "local token");
+    assert_eq!(
+        state.explicit_fields,
+        HashSet::from(["API_KEY".to_string()])
+    );
+}
+
+#[test]
+#[serial]
+fn sparse_local_save_preserves_unrelated_env_and_removes_inherited_keys() {
+    let repo = common::init_git_repo();
+    let _cwd = DirGuard::enter(repo.path());
+    fs::write(
+        repo.path().join(".env"),
+        "# application settings\nAPP_TOKEN='keep me'\nACR_MODEL=old-local\nACR_API_KEY=old\n",
+    )
+    .unwrap();
+
+    let mut cfg = AppConfig::default();
+    cfg.api_key = "new token".into();
+    cfg.save_local_overrides(&HashSet::from(["API_KEY".to_string()]))
+        .unwrap();
+
+    let saved = fs::read_to_string(repo.path().join(".env")).unwrap();
+    assert!(saved.contains("# application settings\nAPP_TOKEN='keep me'\n"));
+    assert!(!saved.contains("ACR_MODEL"));
+    assert!(saved.contains("ACR_API_KEY=\"new token\""));
 }
 
 #[test]
@@ -165,20 +243,21 @@ fn set_field_parses_boolean_and_numeric_values() {
         .expect("set use gitmoji");
     cfg.set_field("WARN_STAGED_FILES_THRESHOLD", "15")
         .expect("set warning threshold");
-    cfg.set_field("WARN_STAGED_FILES_THRESHOLD", "invalid")
-        .expect("set invalid warning threshold");
+    assert!(cfg
+        .set_field("WARN_STAGED_FILES_THRESHOLD", "invalid")
+        .is_err());
     cfg.set_field("POST_COMMIT_PUSH", "ALWAYS")
         .expect("set post commit push");
 
     assert!(!cfg.one_liner);
     assert!(cfg.use_gitmoji);
-    assert_eq!(cfg.warn_staged_files_threshold, 20);
+    assert_eq!(cfg.warn_staged_files_threshold, 15);
     assert_eq!(cfg.post_commit_push, "always");
 }
 
 #[test]
 #[serial]
-fn load_errors_when_locale_has_no_i18n_resources() {
+fn load_accepts_valid_locale_without_i18n_resources() {
     let repo = common::init_git_repo();
     let _cwd = DirGuard::enter(repo.path());
     let _global = GlobalConfigGuard::backup();
@@ -193,11 +272,8 @@ fn load_errors_when_locale_has_no_i18n_resources() {
     let _acr = EnvGuard::clear(&acr_env_keys());
     let _set_locale = EnvGuard::set(&[("ACR_LOCALE", "pl")]);
 
-    let err = AppConfig::load().expect_err("expected locale validation error");
-    assert!(
-        err.to_string().contains("Unsupported locale"),
-        "unexpected error: {err:#}"
-    );
+    let cfg = AppConfig::load().expect("valid language tags do not require bundled resources");
+    assert_eq!(cfg.locale, "pl");
 }
 
 #[test]
@@ -450,7 +526,7 @@ fn set_field_post_commit_push_normalization() {
     cfg.set_field("POST_COMMIT_PUSH", "Ask").unwrap();
     assert_eq!(cfg.post_commit_push, "ask");
 
-    cfg.set_field("POST_COMMIT_PUSH", "invalid").unwrap();
+    assert!(cfg.set_field("POST_COMMIT_PUSH", "invalid").is_err());
     assert_eq!(cfg.post_commit_push, "ask");
 }
 
@@ -481,11 +557,11 @@ fn set_field_auto_update() {
 }
 
 #[test]
-fn set_field_unknown_field_is_ignored() {
+fn set_field_unknown_field_is_rejected() {
     let mut cfg = AppConfig::default();
     let original = cfg.provider.clone();
 
-    cfg.set_field("UNKNOWN_FIELD", "value").unwrap();
+    assert!(cfg.set_field("UNKNOWN_FIELD", "value").is_err());
     assert_eq!(cfg.provider, original);
 }
 
@@ -513,6 +589,8 @@ fn app_config_default_values() {
     assert!(cfg.fallback_enabled);
     assert!(cfg.track_generated_commits);
     assert!(!cfg.diff_exclude_globs.is_empty());
+    assert_eq!(cfg.max_diff_bytes, 200_000);
+    assert!(cfg.sensitive_file_globs.contains(&".env".to_string()));
 }
 
 #[test]

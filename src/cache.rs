@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use inquire::Select;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const MAX_COMMITS_PER_REPO: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCommit {
@@ -38,9 +38,14 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 fn repo_path_hash(path: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    // Stable FNV-1a identifier: unlike DefaultHasher, this is explicitly
+    // deterministic across Rust releases and platforms.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn index_path() -> Option<PathBuf> {
@@ -62,20 +67,12 @@ fn load_index() -> Result<CacheIndex> {
     Ok(idx)
 }
 
-fn save_index(index: &CacheIndex) -> Result<()> {
-    let dir = cache_dir().context("Could not determine cache directory")?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-    let path = dir.join("index.toml");
+fn save_index_unlocked(path: &Path, index: &CacheIndex) -> Result<()> {
     let content = toml::to_string_pretty(index).context("Failed to serialize cache index")?;
-    let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, &content)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
-        .with_context(|| format!("Failed to rename temp file to {}", path.display()))?;
-    Ok(())
+    crate::persistence::atomic_write_unlocked(path, content.as_bytes())
 }
 
-fn load_repo_cache(repo_path: &str) -> Result<RepoCache> {
+fn load_repo_cache(repo_path: &str, cache_file: Option<&str>) -> Result<RepoCache> {
     let dir = match cache_dir() {
         Some(d) => d,
         None => {
@@ -85,8 +82,11 @@ fn load_repo_cache(repo_path: &str) -> Result<RepoCache> {
             })
         }
     };
-    let hash = repo_path_hash(repo_path);
-    let path = dir.join(format!("{hash}.toml"));
+    let cache_file = cache_file
+        .map(validate_cache_filename)
+        .transpose()?
+        .unwrap_or_else(|| format!("{}.toml", repo_path_hash(repo_path)));
+    let path = dir.join(cache_file);
     if !path.exists() {
         return Ok(RepoCache {
             repo_path: repo_path.into(),
@@ -100,39 +100,73 @@ fn load_repo_cache(repo_path: &str) -> Result<RepoCache> {
     Ok(cache)
 }
 
-fn save_repo_cache(cache: &RepoCache) -> Result<()> {
+fn save_repo_cache_unlocked(cache: &RepoCache, cache_file: &str) -> Result<()> {
     let dir = cache_dir().context("Could not determine cache directory")?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-    let hash = repo_path_hash(&cache.repo_path);
-    let path = dir.join(format!("{hash}.toml"));
+    let path = dir.join(validate_cache_filename(cache_file)?);
     let content = toml::to_string_pretty(cache).context("Failed to serialize repo cache")?;
-    let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, &content)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
-        .with_context(|| format!("Failed to rename temp file to {}", path.display()))?;
-    Ok(())
+    crate::persistence::atomic_write_unlocked(&path, content.as_bytes())
 }
 
 pub fn record_commit(repo_path: &str, hash: &str, message_preview: &str) -> Result<()> {
-    let mut index = load_index()?;
-    let cache_file = format!("{}.toml", repo_path_hash(repo_path));
+    let normalized = std::fs::canonicalize(repo_path)
+        .unwrap_or_else(|_| PathBuf::from(repo_path))
+        .to_string_lossy()
+        .into_owned();
+    let index_path = index_path().context("Could not determine cache index path")?;
+    crate::persistence::with_file_lock(&index_path, || {
+        let mut index = load_index()?;
+        repair_index(&mut index);
+        let entry = if let Some(entry) = index
+            .repos
+            .iter()
+            .find(|entry| entry.repo_path == normalized)
+        {
+            entry.clone()
+        } else {
+            let entry = CacheIndexEntry {
+                repo_path: normalized.clone(),
+                cache_file: format!("{}.toml", repo_path_hash(&normalized)),
+            };
+            index.repos.push(entry.clone());
+            entry
+        };
 
-    if !index.repos.iter().any(|e| e.repo_path == repo_path) {
-        index.repos.push(CacheIndexEntry {
-            repo_path: repo_path.into(),
-            cache_file,
+        let mut cache = load_repo_cache(&normalized, Some(&entry.cache_file))?;
+        cache.repo_path = normalized.clone();
+        cache.commits.retain(|commit| commit.hash != hash);
+        cache.commits.push(CachedCommit {
+            hash: hash.into(),
+            message_preview: message_preview.into(),
         });
-        save_index(&index)?;
-    }
+        if cache.commits.len() > MAX_COMMITS_PER_REPO {
+            let excess = cache.commits.len() - MAX_COMMITS_PER_REPO;
+            cache.commits.drain(..excess);
+        }
+        save_repo_cache_unlocked(&cache, &entry.cache_file)?;
+        save_index_unlocked(&index_path, &index)
+    })
+}
 
-    let mut cache = load_repo_cache(repo_path)?;
-    cache.commits.push(CachedCommit {
-        hash: hash.into(),
-        message_preview: message_preview.into(),
+fn validate_cache_filename(file: &str) -> Result<String> {
+    let path = Path::new(file);
+    if path.file_name().and_then(|name| name.to_str()) != Some(file)
+        || path.extension().and_then(|extension| extension.to_str()) != Some("toml")
+    {
+        anyhow::bail!("Invalid cache filename '{file}'");
+    }
+    Ok(file.to_string())
+}
+
+fn repair_index(index: &mut CacheIndex) {
+    let Some(dir) = cache_dir() else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    index.repos.retain(|entry| {
+        validate_cache_filename(&entry.cache_file).is_ok()
+            && seen.insert(entry.repo_path.clone())
+            && (dir.join(&entry.cache_file).exists() || Path::new(&entry.repo_path).exists())
     });
-    save_repo_cache(&cache)?;
-    Ok(())
 }
 
 pub fn get_head_hash() -> Result<String> {
@@ -184,7 +218,7 @@ fn show_repo_commits(cache: &RepoCache) -> Result<()> {
         let commit = &cache.commits[cache.commits.len() - 1 - idx];
 
         let status = std::process::Command::new("git")
-            .args(["show", &commit.hash])
+            .args(["-C", &cache.repo_path, "show", &commit.hash])
             .status();
 
         match status {
@@ -207,7 +241,13 @@ fn show_repo_commits(cache: &RepoCache) -> Result<()> {
 pub fn interactive_history() -> Result<()> {
     match crate::git::find_repo_root() {
         Ok(repo_root) => {
-            let cache = load_repo_cache(&repo_root)?;
+            let index = load_index()?;
+            let cache_file = index
+                .repos
+                .iter()
+                .find(|entry| entry.repo_path == repo_root)
+                .map(|entry| entry.cache_file.as_str());
+            let cache = load_repo_cache(&repo_root, cache_file)?;
             show_repo_commits(&cache)?;
         }
         Err(_) => {
@@ -219,7 +259,12 @@ pub fn interactive_history() -> Result<()> {
 
             let options: Vec<String> = index.repos.iter().map(|e| e.repo_path.clone()).collect();
             if let Ok(repo_path) = Select::new("Select repository:", options).prompt() {
-                let cache = load_repo_cache(&repo_path)?;
+                let cache_file = index
+                    .repos
+                    .iter()
+                    .find(|entry| entry.repo_path == repo_path)
+                    .map(|entry| entry.cache_file.as_str());
+                let cache = load_repo_cache(&repo_path, cache_file)?;
                 show_repo_commits(&cache)?;
             }
         }

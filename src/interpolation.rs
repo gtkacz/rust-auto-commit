@@ -1,25 +1,34 @@
 use crate::config::AppConfig;
+use anyhow::{Context, Result};
 use regex_lite::Regex;
+use std::sync::OnceLock;
 
 /// Interpolate `$VARIABLE_NAME` patterns in a string using environment variables.
-/// Before interpolation, ACR_ config values are temporarily set as env vars.
-pub fn interpolate(template: &str, cfg: &AppConfig) -> String {
-    // Temporarily set ACR_ env vars from config so $ACR_MODEL etc. resolve
-    let env_pairs = [
-        ("ACR_PROVIDER", &cfg.provider),
-        ("ACR_MODEL", &cfg.model),
-        ("ACR_API_KEY", &cfg.api_key),
-        ("ACR_LOCALE", &cfg.locale),
-    ];
-    for (key, val) in &env_pairs {
-        std::env::set_var(key, val);
+///
+/// Config-backed `ACR_*` values are resolved directly and the process
+/// environment is never mutated. Missing variables are errors instead of being
+/// silently erased from URLs or headers.
+pub fn interpolate(template: &str, cfg: &AppConfig) -> Result<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\$([A-Za-z_][A-Za-z0-9_]*)").unwrap());
+    let mut result = String::with_capacity(template.len());
+    let mut end = 0;
+
+    for captures in re.captures_iter(template) {
+        let full = captures.get(0).expect("full regex match");
+        let name = captures.get(1).expect("variable capture").as_str();
+        result.push_str(&template[end..full.start()]);
+        let value = match name {
+            "ACR_PROVIDER" => cfg.provider.clone(),
+            "ACR_MODEL" => cfg.model.clone(),
+            "ACR_API_KEY" => cfg.api_key.clone(),
+            "ACR_LOCALE" => cfg.locale.clone(),
+            _ => std::env::var(name)
+                .with_context(|| format!("Environment variable '{name}' is not set"))?,
+        };
+        result.push_str(&value);
+        end = full.end();
     }
-
-    let re = Regex::new(r"\$([A-Za-z_][A-Za-z0-9_]*)").unwrap();
-    let result = re.replace_all(template, |caps: &regex_lite::Captures| {
-        let var_name = &caps[1];
-        std::env::var(var_name).unwrap_or_default()
-    });
-
-    result.into_owned()
+    result.push_str(&template[end..]);
+    Ok(result)
 }

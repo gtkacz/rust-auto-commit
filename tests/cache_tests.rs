@@ -205,3 +205,63 @@ fn get_head_hash_updates_after_commit() {
     assert_eq!(get_head_hash().unwrap(), hash2);
     assert_ne!(hash1, hash2);
 }
+
+#[test]
+#[serial]
+fn record_commit_honors_index_cache_filename_and_deduplicates_hashes() {
+    let (cfg_dir, _env) = setup_cache_env();
+    let repo = init_git_repo();
+    let repo_path = fs::canonicalize(repo.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let cache_dir = cfg_dir.path().join("cgen/cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let index = CacheIndex {
+        repos: vec![CacheIndexEntry {
+            repo_path: repo_path.clone(),
+            cache_file: "custom-name.toml".into(),
+        }],
+    };
+    fs::write(
+        cache_dir.join("index.toml"),
+        toml::to_string(&index).unwrap(),
+    )
+    .unwrap();
+
+    record_commit(&repo_path, "abc", "first").unwrap();
+    record_commit(&repo_path, "abc", "updated").unwrap();
+    let cache: RepoCache =
+        toml::from_str(&fs::read_to_string(cache_dir.join("custom-name.toml")).unwrap()).unwrap();
+    assert_eq!(cache.commits.len(), 1);
+    assert_eq!(cache.commits[0].message_preview, "updated");
+}
+
+#[test]
+#[serial]
+fn concurrent_cache_writers_do_not_lose_entries() {
+    let (_cfg_dir, _env) = setup_cache_env();
+    let repo = init_git_repo();
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    std::thread::scope(|scope| {
+        for index in 0..12 {
+            let repo_path = repo_path.clone();
+            scope.spawn(move || {
+                record_commit(
+                    &repo_path,
+                    &format!("hash-{index}"),
+                    &format!("message-{index}"),
+                )
+                .unwrap();
+            });
+        }
+    });
+
+    let cache_dir = _cfg_dir.path().join("cgen/cache");
+    let index: CacheIndex =
+        toml::from_str(&fs::read_to_string(cache_dir.join("index.toml")).unwrap()).unwrap();
+    let cache: RepoCache =
+        toml::from_str(&fs::read_to_string(cache_dir.join(&index.repos[0].cache_file)).unwrap())
+            .unwrap();
+    assert_eq!(cache.commits.len(), 12);
+}

@@ -1,5 +1,5 @@
 use auto_commit_rs::config::AppConfig;
-use auto_commit_rs::prompt::{build_system_prompt, clean_commit_message};
+use auto_commit_rs::prompt::{build_system_prompt, clean_commit_message, validate_commit_message};
 
 #[test]
 fn prompt_includes_core_sections_by_default() {
@@ -15,9 +15,11 @@ fn prompt_includes_core_sections_by_default() {
 
 #[test]
 fn prompt_includes_unicode_gitmoji_when_enabled() {
-    let mut cfg = AppConfig::default();
-    cfg.use_gitmoji = true;
-    cfg.gitmoji_format = "unicode".into();
+    let cfg = AppConfig {
+        use_gitmoji: true,
+        gitmoji_format: "unicode".into(),
+        ..Default::default()
+    };
 
     let prompt = build_system_prompt(&cfg);
     assert!(prompt.contains("relevant emoji in unicode format"));
@@ -26,11 +28,13 @@ fn prompt_includes_unicode_gitmoji_when_enabled() {
 
 #[test]
 fn prompt_includes_shortcode_gitmoji_and_locale_when_configured() {
-    let mut cfg = AppConfig::default();
-    cfg.use_gitmoji = true;
-    cfg.gitmoji_format = "shortcode".into();
-    cfg.locale = "pl".into();
-    cfg.one_liner = false;
+    let cfg = AppConfig {
+        use_gitmoji: true,
+        gitmoji_format: "shortcode".into(),
+        locale: "pl".into(),
+        one_liner: false,
+        ..Default::default()
+    };
 
     let prompt = build_system_prompt(&cfg);
     assert!(prompt.contains("relevant emoji in :shortcode: format"));
@@ -40,9 +44,11 @@ fn prompt_includes_shortcode_gitmoji_and_locale_when_configured() {
 
 #[test]
 fn prompt_gitmoji_does_not_override_conventional_commits() {
-    let mut cfg = AppConfig::default();
-    cfg.use_gitmoji = true;
-    cfg.gitmoji_format = "unicode".into();
+    let cfg = AppConfig {
+        use_gitmoji: true,
+        gitmoji_format: "unicode".into(),
+        ..Default::default()
+    };
 
     let prompt = build_system_prompt(&cfg);
     assert!(prompt.contains("following the Conventional Commits specification"));
@@ -54,8 +60,10 @@ fn prompt_gitmoji_does_not_override_conventional_commits() {
 
 #[test]
 fn prompt_uses_custom_base_prompt() {
-    let mut cfg = AppConfig::default();
-    cfg.llm_system_prompt = "custom base prompt".into();
+    let cfg = AppConfig {
+        llm_system_prompt: "custom base prompt".into(),
+        ..Default::default()
+    };
 
     let prompt = build_system_prompt(&cfg);
     assert!(prompt.starts_with("custom base prompt"));
@@ -98,4 +106,27 @@ fn clean_message_handles_multiline_with_fence() {
         clean_commit_message(raw),
         "feat: add search\n\nAdds full-text search support."
     );
+}
+
+#[test]
+fn validates_conventional_one_liner() {
+    let cfg = AppConfig::default();
+    validate_commit_message("feat(parser): add strict validation", &cfg).unwrap();
+    assert!(validate_commit_message("", &cfg).is_err());
+    assert!(validate_commit_message("not a conventional header", &cfg).is_err());
+    assert!(validate_commit_message("feat: first\n\nbody", &cfg).is_err());
+}
+
+#[test]
+fn validates_configured_gitmoji_format() {
+    let mut cfg = AppConfig {
+        use_gitmoji: true,
+        ..Default::default()
+    };
+    validate_commit_message("✨ feat: add presets", &cfg).unwrap();
+    assert!(validate_commit_message("feat: add presets", &cfg).is_err());
+
+    cfg.gitmoji_format = "shortcode".into();
+    validate_commit_message(":sparkles: feat: add presets", &cfg).unwrap();
+    assert!(validate_commit_message("✨ feat: add presets", &cfg).is_err());
 }

@@ -1,9 +1,15 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const GITHUB_REPO: &str = "gtkacz/smart-commit-rs";
+const CRATE_NAME: &str = "auto-commit-rs";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct VersionCheck {
     pub latest: String,
@@ -11,12 +17,9 @@ pub struct VersionCheck {
     pub update_available: bool,
 }
 
-/// Fetch the latest release tag from GitHub API with a short timeout
+/// Fetch the latest release tag from GitHub API with a short timeout.
 pub fn fetch_latest_version() -> Result<String> {
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        GITHUB_REPO
-    );
+    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(5))
         .build();
@@ -29,37 +32,34 @@ pub fn fetch_latest_version() -> Result<String> {
         .into_json()
         .context("Failed to parse GitHub API response")?;
 
-    let tag = response["tag_name"]
+    response["tag_name"]
         .as_str()
-        .context("No tag_name in GitHub release response")?;
-
-    Ok(tag.to_string())
+        .map(str::to_string)
+        .context("No tag_name in GitHub release response")
 }
 
-/// Parse a version string (strips leading 'v' if present) into (major, minor, patch)
+/// Parse a strict release version (with an optional leading `v`).
 pub fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
-    let v = version.strip_prefix('v').unwrap_or(version);
-    let parts: Vec<&str> = v.split('.').collect();
-    if parts.len() != 3 {
+    let value = version.strip_prefix('v').unwrap_or(version);
+    let mut parts = value.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    if parts.next().is_some() {
         return None;
     }
-    Some((
-        parts[0].parse().ok()?,
-        parts[1].parse().ok()?,
-        parts[2].parse().ok()?,
-    ))
+    Some(parsed)
 }
 
-/// Check if a newer version is available on GitHub
 pub fn check_version() -> Result<VersionCheck> {
     let latest = fetch_latest_version()?;
     let current = CURRENT_VERSION.to_string();
-
     let update_available = match (parse_semver(&latest), parse_semver(&current)) {
-        (Some(latest_v), Some(current_v)) => latest_v > current_v,
+        (Some(latest), Some(current)) => latest > current,
         _ => false,
     };
-
     Ok(VersionCheck {
         latest,
         current,
@@ -67,71 +67,203 @@ pub fn check_version() -> Result<VersionCheck> {
     })
 }
 
-/// Run the appropriate update command for the current platform
-pub fn run_update() -> Result<()> {
-    if is_cargo_available() {
-        println!("{}", "Updating via cargo...".cyan().bold());
-        let status = std::process::Command::new("cargo")
-            .args(["install", "smart-commit-rs"])
+/// Update the exact installation that launched this process.
+pub fn run_update(version: &str) -> Result<()> {
+    let version_number = version.strip_prefix('v').unwrap_or(version);
+    parse_semver(version).context("Release tag is not a strict semantic version")?;
+    let executable = std::env::current_exe()
+        .context("Could not locate the running cgen executable")?
+        .canonicalize()
+        .context("Could not resolve the running cgen executable")?;
+
+    if !cfg!(windows) && installed_by_cargo(&executable) && cargo_available() {
+        println!("{}", "Updating the Cargo installation...".cyan().bold());
+        let status = Command::new("cargo")
+            .args([
+                "install",
+                CRATE_NAME,
+                "--version",
+                version_number,
+                "--locked",
+                "--force",
+            ])
             .status()
             .context("Failed to run cargo install")?;
-
         if !status.success() {
-            anyhow::bail!("cargo install failed with exit code {}", status);
+            anyhow::bail!("cargo install {CRATE_NAME} failed with status {status}");
         }
     } else {
-        run_platform_installer()?;
+        println!("{}", "Updating the release binary...".cyan().bold());
+        update_release_binary(version, &executable)?;
     }
 
     println!("{}", "Update complete!".green().bold());
     Ok(())
 }
 
-fn is_cargo_available() -> bool {
-    std::process::Command::new("cargo")
+fn installed_by_cargo(executable: &Path) -> bool {
+    cargo_bin_dirs().into_iter().any(|directory| {
+        directory
+            .canonicalize()
+            .map(|directory| executable.parent() == Some(directory.as_path()))
+            .unwrap_or(false)
+    })
+}
+
+fn cargo_bin_dirs() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        directories.push(PathBuf::from(cargo_home).join("bin"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        let default = home.join(".cargo").join("bin");
+        if !directories.contains(&default) {
+            directories.push(default);
+        }
+    }
+    directories
+}
+
+fn cargo_available() -> bool {
+    Command::new("cargo")
         .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
-fn run_platform_installer() -> Result<()> {
-    if cfg!(target_os = "windows") {
-        println!("{}", "Updating via PowerShell installer...".cyan().bold());
-        let status = std::process::Command::new("powershell")
-            .args([
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                "irm https://raw.githubusercontent.com/gtkacz/smart-commit-rs/main/scripts/install.ps1 | iex",
-            ])
-            .status()
-            .context("Failed to run PowerShell installer")?;
+fn update_release_binary(version: &str, executable: &Path) -> Result<()> {
+    let artifact = platform_artifact()?;
+    let base = format!("https://github.com/{GITHUB_REPO}/releases/download/{version}");
+    let binary = download(&format!("{base}/{artifact}"), MAX_DOWNLOAD_BYTES)
+        .with_context(|| format!("Failed to download {artifact}"))?;
+    let checksums = download(&format!("{base}/checksums.sha256"), 1_048_576)
+        .context("Failed to download release checksums")?;
+    let checksums =
+        String::from_utf8(checksums).context("Release checksums were not valid UTF-8")?;
+    verify_checksum(artifact, &binary, &checksums)?;
+    replace_executable(executable, &binary)
+}
 
-        if !status.success() {
-            anyhow::bail!("PowerShell installer failed");
-        }
-    } else {
-        println!("{}", "Updating via install script...".cyan().bold());
-        let status = std::process::Command::new("bash")
-            .args([
-                "-c",
-                "curl -fsSL https://raw.githubusercontent.com/gtkacz/smart-commit-rs/main/scripts/install.sh | bash",
-            ])
-            .status()
-            .context("Failed to run install script")?;
-
-        if !status.success() {
-            anyhow::bail!("Install script failed");
-        }
+fn download(url: &str, limit: usize) -> Result<Vec<u8>> {
+    let response = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .get(url)
+        .set("User-Agent", "cgen")
+        .call()
+        .with_context(|| format!("GET {url} failed"))?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("Failed to read download")?;
+    if bytes.len() > limit {
+        anyhow::bail!("Download exceeded the {limit}-byte safety limit");
     }
+    Ok(bytes)
+}
 
+fn verify_checksum(artifact: &str, binary: &[u8], checksums: &str) -> Result<()> {
+    let expected = checksum_for(artifact, checksums)
+        .with_context(|| format!("No checksum published for {artifact}"))?;
+    let actual = format!("{:x}", Sha256::digest(binary));
+    if !actual.eq_ignore_ascii_case(expected) {
+        anyhow::bail!(
+            "Checksum mismatch for {artifact}; expected {expected}, received {actual}. Existing binary was not changed."
+        );
+    }
     Ok(())
 }
 
-/// Print a warning that a newer version is available
+fn checksum_for<'a>(artifact: &str, checksums: &'a str) -> Option<&'a str> {
+    checksums.lines().find_map(|line| {
+        let (checksum, filename) = line.split_once(char::is_whitespace)?;
+        let filename = filename.trim_start().trim_start_matches('*');
+        (filename == artifact
+            && checksum.len() == 64
+            && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(checksum)
+    })
+}
+
+#[cfg(not(windows))]
+fn replace_executable(executable: &Path, binary: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = executable
+        .parent()
+        .context("Executable must have a parent directory")?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".cgen-update-")
+        .tempfile_in(parent)
+        .with_context(|| format!("Cannot write updates in {}", parent.display()))?;
+    temp.write_all(binary).context("Failed to write update")?;
+    temp.flush().context("Failed to flush update")?;
+    temp.as_file().sync_all().context("Failed to sync update")?;
+    temp.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .context("Failed to make update executable")?;
+    temp.persist(executable)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Failed to replace {}", executable.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_executable(executable: &Path, binary: &[u8]) -> Result<()> {
+    let parent = executable
+        .parent()
+        .context("Executable must have a parent directory")?;
+    let pending = parent.join(format!(".cgen-update-{}.exe", std::process::id()));
+    let script = parent.join(format!(".cgen-update-{}.ps1", std::process::id()));
+    std::fs::write(&pending, binary).context("Failed to stage Windows update")?;
+    let script_body = format!(
+        "$ErrorActionPreference='Stop'\nWait-Process -Id {} -ErrorAction SilentlyContinue\nMove-Item -LiteralPath '{}' -Destination '{}' -Force\nRemove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force\n",
+        std::process::id(),
+        pending.display().to_string().replace('\'', "''"),
+        executable.display().to_string().replace('\'', "''"),
+    );
+    std::fs::write(&script, script_body).context("Failed to stage Windows update helper")?;
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            &script.to_string_lossy(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to launch Windows update helper")?;
+    Ok(())
+}
+
+fn platform_artifact() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => {
+            #[cfg(target_env = "musl")]
+            {
+                Ok("cgen-linux-amd64-musl")
+            }
+            #[cfg(not(target_env = "musl"))]
+            {
+                Ok("cgen-linux-amd64")
+            }
+        }
+        ("linux", "aarch64") => Ok("cgen-linux-arm64"),
+        ("macos", "x86_64") => Ok("cgen-macos-amd64"),
+        ("macos", "aarch64") => Ok("cgen-macos-arm64"),
+        ("windows", "x86_64") => Ok("cgen-windows-amd64.exe"),
+        (os, arch) => anyhow::bail!("No release artifact is available for {os}/{arch}"),
+    }
+}
+
 pub fn print_update_warning(latest: &str) {
     eprintln!(
         "\n{}  {} → {}  (run {} to update)",
@@ -151,121 +283,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_github_repo_constant() {
-        assert_eq!(GITHUB_REPO, "gtkacz/smart-commit-rs");
+    fn semver_and_comparison_are_strict() {
+        assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("1.2"), None);
+        assert_eq!(parse_semver("1.2.3.4"), None);
+        assert_eq!(parse_semver("1.2.x"), None);
     }
 
     #[test]
-    fn test_current_version_not_empty() {
-        assert!(!CURRENT_VERSION.is_empty());
+    fn checksum_lookup_and_verification_are_exact() {
+        let binary = b"verified binary";
+        let digest = format!("{:x}", Sha256::digest(binary));
+        let checksums = format!("{digest}  cgen-linux-amd64\n");
+        verify_checksum("cgen-linux-amd64", binary, &checksums).unwrap();
+        assert!(verify_checksum("other", binary, &checksums).is_err());
+        assert!(verify_checksum("cgen-linux-amd64", b"tampered", &checksums).is_err());
     }
 
     #[test]
-    fn test_current_version_is_semver() {
-        let version = current_version();
-        assert!(parse_semver(version).is_some());
+    fn crate_name_matches_manifest_package() {
+        assert_eq!(CRATE_NAME, env!("CARGO_PKG_NAME"));
     }
 
     #[test]
-    fn test_parse_semver_basic() {
-        let v = parse_semver("1.2.3").unwrap();
-        assert_eq!(v, (1, 2, 3));
-    }
-
-    #[test]
-    fn test_parse_semver_with_v() {
-        let v = parse_semver("v1.2.3").unwrap();
-        assert_eq!(v, (1, 2, 3));
-    }
-
-    #[test]
-    fn test_parse_semver_invalid_parts() {
-        assert!(parse_semver("1.2").is_none());
-        assert!(parse_semver("1").is_none());
-        assert!(parse_semver("").is_none());
-        assert!(parse_semver("1.2.3.4").is_none());
-    }
-
-    #[test]
-    fn test_parse_semver_non_numeric() {
-        assert!(parse_semver("a.b.c").is_none());
-        assert!(parse_semver("1.2.x").is_none());
-    }
-
-    #[test]
-    fn test_parse_semver_large_numbers() {
-        let v = parse_semver("100.200.300").unwrap();
-        assert_eq!(v, (100, 200, 300));
-    }
-
-    #[test]
-    fn test_parse_semver_zeros() {
-        let v = parse_semver("0.0.0").unwrap();
-        assert_eq!(v, (0, 0, 0));
-    }
-
-    #[test]
-    fn test_version_check_struct() {
-        let check = VersionCheck {
-            latest: "2.0.0".into(),
-            current: "1.0.0".into(),
-            update_available: true,
-        };
-        assert_eq!(check.latest, "2.0.0");
-        assert_eq!(check.current, "1.0.0");
-        assert!(check.update_available);
-    }
-
-    #[test]
-    fn test_version_comparison_logic() {
-        // Simulate the comparison logic used in check_version
-        let latest = "2.0.0";
-        let current = "1.5.0";
-        let update_available = match (parse_semver(latest), parse_semver(current)) {
-            (Some(latest_v), Some(current_v)) => latest_v > current_v,
-            _ => false,
-        };
-        assert!(update_available);
-    }
-
-    #[test]
-    fn test_version_comparison_no_update() {
-        let latest = "1.0.0";
-        let current = "1.5.0";
-        let update_available = match (parse_semver(latest), parse_semver(current)) {
-            (Some(latest_v), Some(current_v)) => latest_v > current_v,
-            _ => false,
-        };
-        assert!(!update_available);
-    }
-
-    #[test]
-    fn test_version_comparison_same() {
-        let latest = "1.5.0";
-        let current = "1.5.0";
-        let update_available = match (parse_semver(latest), parse_semver(current)) {
-            (Some(latest_v), Some(current_v)) => latest_v > current_v,
-            _ => false,
-        };
-        assert!(!update_available);
-    }
-
-    #[test]
-    fn test_version_comparison_invalid() {
-        let latest = "invalid";
-        let current = "1.0.0";
-        let update_available = match (parse_semver(latest), parse_semver(current)) {
-            (Some(latest_v), Some(current_v)) => latest_v > current_v,
-            _ => false,
-        };
-        assert!(!update_available); // Falls back to false for invalid
-    }
-
-    #[test]
-    fn test_print_update_warning_no_panic() {
-        // Just ensure it doesn't panic
-        print_update_warning("2.0.0");
-        print_update_warning("v1.5.0");
-        print_update_warning("");
+    fn current_version_is_semver() {
+        assert!(parse_semver(current_version()).is_some());
     }
 }

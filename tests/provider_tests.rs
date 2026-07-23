@@ -8,13 +8,14 @@ use serial_test::serial;
 use std::fs;
 
 fn cfg_for(provider_name: &str, api_url: String) -> AppConfig {
-    let mut cfg = AppConfig::default();
-    cfg.provider = provider_name.to_string();
-    cfg.model = "test-model".into();
-    cfg.api_key = "test-key".into();
-    cfg.api_url = api_url;
-    cfg.fallback_enabled = false;
-    cfg
+    AppConfig {
+        provider: provider_name.to_string(),
+        model: "test-model".into(),
+        api_key: "test-key".into(),
+        api_url,
+        fallback_enabled: false,
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -61,7 +62,10 @@ fn default_model_for_all_known_providers() {
 
 #[test]
 fn provider_requires_api_key_returns_false_for_local_providers() {
-    let ollama_cfg = cfg_for("ollama", "http://localhost:11434/v1/chat/completions".into());
+    let ollama_cfg = cfg_for(
+        "ollama",
+        "http://localhost:11434/v1/chat/completions".into(),
+    );
     assert!(!provider::provider_requires_api_key(&ollama_cfg));
 
     let lm_studio_cfg = cfg_for("lm_studio", "http://localhost:1234/api/v1/chat".into());
@@ -90,8 +94,7 @@ fn call_llm_rejects_empty_response_content() {
         .create();
 
     let cfg = cfg_for("openai", format!("{}/empty", server.url()));
-    let err = provider::call_llm(&cfg, "system", "diff")
-        .expect_err("empty content should fail");
+    let err = provider::call_llm(&cfg, "system", "diff").expect_err("empty content should fail");
     assert!(err.to_string().contains("empty commit message"));
     mock.assert();
 }
@@ -168,10 +171,11 @@ fn call_llm_anthropic_uses_anthropic_payload_and_headers() {
 
 #[test]
 fn call_llm_custom_provider_requires_url() {
-    let mut cfg = AppConfig::default();
-    cfg.provider = "custom-provider".into();
-    cfg.api_url.clear();
-    cfg.api_key = "k".into();
+    let cfg = AppConfig {
+        provider: "custom-provider".into(),
+        api_key: "k".into(),
+        ..Default::default()
+    };
     let err = provider::call_llm(&cfg, "system", "diff")
         .expect_err("missing custom URL should fail")
         .to_string();

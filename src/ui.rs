@@ -1,7 +1,7 @@
 use inquire::Select;
 
 /// Replacement for `inquire::Confirm` — presents a Select with "Yes" / "No" choices.
-/// Returns `default_val` on cancellation (Esc/Ctrl-C).
+/// Cancellation (Esc/Ctrl-C) is always treated as "No".
 pub fn confirm(prompt: &str, default_val: bool) -> bool {
     let choices = if default_val {
         vec!["Yes", "No"]
@@ -11,7 +11,7 @@ pub fn confirm(prompt: &str, default_val: bool) -> bool {
     match Select::new(prompt, choices).prompt() {
         Ok("Yes") => true,
         Ok("No") => false,
-        _ => default_val,
+        _ => false,
     }
 }
 

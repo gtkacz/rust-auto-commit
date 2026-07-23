@@ -1,13 +1,22 @@
 use anyhow::{bail, Context, Result};
 use glob::Pattern;
+use regex_lite::Regex;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 /// Get the output of `git diff --staged`
 pub fn get_staged_diff() -> Result<String> {
     let output = Command::new("git")
-        .args(["diff", "--staged"])
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--staged",
+            "--no-ext-diff",
+        ])
         .output()
         .context("Failed to run git diff --staged")?;
 
@@ -31,7 +40,7 @@ pub fn get_staged_diff() -> Result<String> {
 /// List staged file paths
 pub fn list_staged_files() -> Result<Vec<String>> {
     let output = Command::new("git")
-        .args(["diff", "--staged", "--name-only"])
+        .args(["diff", "--staged", "--name-only", "-z"])
         .output()
         .context("Failed to run git diff --staged --name-only")?;
 
@@ -40,11 +49,11 @@ pub fn list_staged_files() -> Result<Vec<String>> {
         bail!("git diff --staged --name-only failed: {stderr}");
     }
 
-    let files = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
+    let files = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
         .collect::<Vec<_>>();
 
     Ok(files)
@@ -90,6 +99,30 @@ pub fn run_push(suppress_output: bool) -> Result<()> {
         bail!("git push exited with status {status}");
     }
 
+    Ok(())
+}
+
+pub fn run_force_push_with_lease(suppress_output: bool) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.args(["push", "--force-with-lease"]);
+    configure_stdio(&mut cmd, suppress_output);
+    let status = cmd
+        .status()
+        .context("Failed to run git push --force-with-lease")?;
+    if !status.success() {
+        bail!("git push --force-with-lease exited with status {status}");
+    }
+    Ok(())
+}
+
+pub fn push_tag(tag_name: &str, suppress_output: bool) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.args(["push", "origin", &format!("refs/tags/{tag_name}")]);
+    configure_stdio(&mut cmd, suppress_output);
+    let status = cmd.status().context("Failed to push git tag")?;
+    if !status.success() {
+        bail!("Branch push succeeded, but tag '{tag_name}' remains local (tag push exited with status {status})");
+    }
     Ok(())
 }
 
@@ -188,14 +221,23 @@ pub fn undo_last_commit_soft(suppress_output: bool) -> Result<()> {
     ensure_head_exists()?;
 
     let mut cmd = Command::new("git");
-    cmd.args(["reset", "--soft", "HEAD~1"]);
+    let has_parent = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD^"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("Failed to inspect HEAD parent")?
+        .success();
+    if has_parent {
+        cmd.args(["reset", "--soft", "HEAD~1"]);
+    } else {
+        cmd.args(["update-ref", "-d", "HEAD"]);
+    }
     configure_stdio(&mut cmd, suppress_output);
 
-    let status = cmd
-        .status()
-        .context("Failed to run git reset --soft HEAD~1")?;
+    let status = cmd.status().context("Failed to undo latest commit")?;
     if !status.success() {
-        bail!("git reset --soft HEAD~1 exited with status {status}");
+        bail!("Undoing the latest commit exited with status {status}");
     }
     Ok(())
 }
@@ -247,7 +289,15 @@ pub fn ensure_commit_exists(commit: &str) -> Result<()> {
 pub fn get_commit_diff(commit: &str) -> Result<String> {
     ensure_commit_exists(commit)?;
     let output = Command::new("git")
-        .args(["show", "--format=", "--no-color", commit])
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "show",
+            "--format=",
+            "--no-color",
+            "--no-ext-diff",
+            commit,
+        ])
         .output()
         .with_context(|| format!("Failed to run git show for {commit}"))?;
 
@@ -268,7 +318,15 @@ pub fn get_range_diff(older: &str, newer: &str) -> Result<String> {
     ensure_commit_exists(newer)?;
 
     let output = Command::new("git")
-        .args(["diff", "--no-color", older, newer])
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            older,
+            newer,
+        ])
         .output()
         .with_context(|| format!("Failed to run git diff {older} {newer}"))?;
 
@@ -331,8 +389,13 @@ pub fn commit_is_pushed(commit: &str) -> Result<bool> {
         .any(|line| !line.is_empty() && !line.contains("->")))
 }
 
-pub fn rewrite_commit_message(target: &str, message: &str, suppress_output: bool) -> Result<()> {
+pub fn rewrite_commit_message(
+    target: &str,
+    message: &str,
+    suppress_output: bool,
+) -> Result<String> {
     ensure_commit_exists(target)?;
+    let distance = commits_after(target)?;
 
     if is_head_commit(target)? {
         let mut cmd = Command::new("git");
@@ -342,7 +405,7 @@ pub fn rewrite_commit_message(target: &str, message: &str, suppress_output: bool
         if !status.success() {
             bail!("git commit --amend exited with status {status}");
         }
-        return Ok(());
+        return resolve_commit("HEAD");
     }
 
     if commit_is_merge(target)? {
@@ -350,7 +413,25 @@ pub fn rewrite_commit_message(target: &str, message: &str, suppress_output: bool
     }
 
     ensure_ancestor_of_head(target)?;
-    reword_non_head_commit(target, message, suppress_output)
+    reword_non_head_commit(target, message, suppress_output)?;
+    resolve_commit(&format!("HEAD~{distance}"))
+}
+
+fn commits_after(target: &str) -> Result<usize> {
+    let output = Command::new("git")
+        .args(["rev-list", "--count", &format!("{target}..HEAD")])
+        .output()
+        .context("Failed to determine rewritten commit position")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to determine rewritten commit position: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .context("Git returned an invalid commit distance")
 }
 
 fn resolve_commit(commit: &str) -> Result<String> {
@@ -382,25 +463,32 @@ pub fn ensure_ancestor_of_head(commit: &str) -> Result<()> {
 }
 
 fn reword_non_head_commit(target: &str, message: &str, suppress_output: bool) -> Result<()> {
-    let parent = format!("{target}^");
-    let temp = std::env::temp_dir();
-    let sequence_editor = temp.join(format!("cgen-seq-editor-{}.sh", std::process::id()));
-    let message_editor = temp.join(format!("cgen-msg-editor-{}.sh", std::process::id()));
+    let temp = tempfile::tempdir().context("Failed to create rebase helper directory")?;
+    let sequence_editor = temp.path().join("sequence-editor.sh");
+    let message_editor = temp.path().join("message-editor.sh");
 
     write_sequence_editor_script(&sequence_editor)?;
     write_message_editor_script(&message_editor)?;
 
     let mut cmd = Command::new("git");
-    cmd.args(["rebase", "-i", &parent]);
+    let has_parent = Command::new("git")
+        .args(["rev-parse", "--verify", &format!("{target}^")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("Failed to inspect target parent")?
+        .success();
+    if has_parent {
+        cmd.args(["rebase", "-i", &format!("{target}^")]);
+    } else {
+        cmd.args(["rebase", "-i", "--root"]);
+    }
     cmd.env("GIT_SEQUENCE_EDITOR", script_command(&sequence_editor));
     cmd.env("GIT_EDITOR", script_command(&message_editor));
     cmd.env("CGEN_NEW_MESSAGE", message);
     configure_stdio(&mut cmd, suppress_output);
 
     let status = cmd.status().context("Failed to run git rebase -i")?;
-
-    let _ = fs::remove_file(&sequence_editor);
-    let _ = fs::remove_file(&message_editor);
 
     if !status.success() {
         bail!(
@@ -482,57 +570,190 @@ fn parse_semver_tag(tag: &str) -> Result<(u64, u64, u64)> {
 }
 
 /// Filter a unified diff. A file's hunk is kept when it matches an include glob
-/// (allow-over-deny) OR does not match any exclude glob. Matching is on filename.
-/// Excluded files are still committed, just not sent to the LLM for analysis.
+/// (allow-over-deny) OR does not match any exclude glob. Patterns containing a
+/// slash match repository-relative paths; basename patterns retain the
+/// historical `*.ext` behavior. Excluded files are still committed.
 pub fn filter_diff_by_globs(
     diff: &str,
     include_patterns: &[String],
     exclude_patterns: &[String],
-) -> String {
-    let includes = compile_globs(include_patterns);
-    let excludes = compile_globs(exclude_patterns);
+) -> Result<String> {
+    let includes = compile_globs(include_patterns)?;
+    let excludes = compile_globs(exclude_patterns)?;
 
     if includes.is_empty() && excludes.is_empty() {
-        return diff.to_string();
+        if diff.trim().is_empty() {
+            bail!("Diff is empty");
+        }
+        return Ok(diff.to_string());
     }
 
     let mut result = String::new();
     let mut include_current = true;
+    let mut saw_header = false;
 
-    for line in diff.lines() {
+    for line in diff.split_inclusive('\n') {
         if line.starts_with("diff --git ") {
-            // Extract path: "diff --git a/path b/path" -> "path"
-            let file_path = line
-                .strip_prefix("diff --git a/")
-                .and_then(|s| s.split(" b/").next())
-                .unwrap_or("");
-
-            // Check only the filename, not the full path
-            let filename = std::path::Path::new(file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(file_path);
-
+            saw_header = true;
+            let file_path = diff_header_path(line)?;
             // Include wins over exclude (gitignore-`!` semantics).
-            let allowed = includes.iter().any(|p| p.matches(filename));
-            let denied = excludes.iter().any(|p| p.matches(filename));
+            let allowed = includes
+                .iter()
+                .any(|pattern| path_matches(pattern, &file_path));
+            let denied = excludes
+                .iter()
+                .any(|pattern| path_matches(pattern, &file_path));
             include_current = allowed || !denied;
         }
 
         if include_current {
             result.push_str(line);
-            result.push('\n');
         }
     }
 
-    result
+    if !saw_header {
+        bail!("Could not parse diff: no 'diff --git' file headers found");
+    }
+    if result.trim().is_empty() {
+        bail!(
+            "All changed files were excluded from LLM analysis. Adjust diff globs or use --diff-include."
+        );
+    }
+    Ok(result)
 }
 
-fn compile_globs(patterns: &[String]) -> Vec<Pattern> {
+fn compile_globs(patterns: &[String]) -> Result<Vec<Pattern>> {
     patterns
         .iter()
-        .filter_map(|p| Pattern::new(p).ok())
+        .map(|pattern| {
+            Pattern::new(pattern).with_context(|| format!("Invalid diff glob '{pattern}'"))
+        })
         .collect()
+}
+
+fn diff_header_path(line: &str) -> Result<String> {
+    let rest = line
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix("diff --git ")
+        .context("Invalid diff header")?;
+    if rest.starts_with('"') {
+        let tokens = shlex::split(rest).context("Invalid quoted path in diff header")?;
+        let path = tokens
+            .get(1)
+            .context("Diff header is missing its destination path")?;
+        return path
+            .strip_prefix("b/")
+            .map(str::to_string)
+            .context("Diff destination path is missing the 'b/' prefix");
+    }
+    let (_, destination) = rest
+        .rsplit_once(" b/")
+        .context("Diff header is missing its destination path")?;
+    Ok(destination.to_string())
+}
+
+fn path_matches(pattern: &Pattern, path: &str) -> bool {
+    if pattern.matches_path(Path::new(path)) {
+        return true;
+    }
+    !pattern.as_str().contains('/')
+        && Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| pattern.matches(name))
+            .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSafetyReport {
+    pub bytes: usize,
+    pub included_files: Vec<String>,
+    pub omitted_files: Vec<String>,
+    pub sensitive_files: Vec<String>,
+    pub secret_findings: Vec<String>,
+}
+
+pub fn assess_diff_safety(
+    diff: &str,
+    all_files: &[String],
+    sensitive_patterns: &[String],
+) -> Result<DiffSafetyReport> {
+    let patterns = compile_globs(sensitive_patterns)?;
+    let included_files = diff_paths(diff)?;
+    let included: HashSet<&str> = included_files.iter().map(String::as_str).collect();
+    let omitted_files = all_files
+        .iter()
+        .filter(|path| !included.contains(path.as_str()))
+        .cloned()
+        .collect();
+    let sensitive_files = included_files
+        .iter()
+        .filter(|path| patterns.iter().any(|pattern| path_matches(pattern, path)))
+        .cloned()
+        .collect();
+    let secret_findings = detect_secret_findings(diff);
+    Ok(DiffSafetyReport {
+        bytes: diff.len(),
+        included_files,
+        omitted_files,
+        sensitive_files,
+        secret_findings,
+    })
+}
+
+pub fn diff_paths(diff: &str) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for line in diff.lines().filter(|line| line.starts_with("diff --git ")) {
+        let path = diff_header_path(line)?;
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        bail!("Could not determine changed files from diff");
+    }
+    Ok(paths)
+}
+
+fn detect_secret_findings(diff: &str) -> Vec<String> {
+    static HIGH_CONFIDENCE: OnceLock<Regex> = OnceLock::new();
+    static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+    let high_confidence = HIGH_CONFIDENCE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})",
+        )
+        .unwrap()
+    });
+    let assignment = ASSIGNMENT.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{12,}"#,
+        )
+        .unwrap()
+    });
+    let mut findings = Vec::new();
+    for line in diff
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+    {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("$acr_")
+            || lower.contains("example")
+            || lower.contains("placeholder")
+            || lower.contains("[redacted]")
+        {
+            continue;
+        }
+        if high_confidence.is_match(line) {
+            if !findings.contains(&"credential-like token or private key".to_string()) {
+                findings.push("credential-like token or private key".to_string());
+            }
+        } else if assignment.is_match(line)
+            && !findings.contains(&"secret-like assignment".to_string())
+        {
+            findings.push("secret-like assignment".to_string());
+        }
+    }
+    findings
 }
 
 /// Get staged diff with files filtered by include/exclude globs.
@@ -542,11 +763,7 @@ pub fn get_staged_diff_filtered(
     exclude_patterns: &[String],
 ) -> Result<String> {
     let diff = get_staged_diff()?;
-    Ok(filter_diff_by_globs(
-        &diff,
-        include_patterns,
-        exclude_patterns,
-    ))
+    filter_diff_by_globs(&diff, include_patterns, exclude_patterns)
 }
 
 #[cfg(test)]
@@ -650,19 +867,16 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_diff_all_invalid_patterns() {
+    fn test_filter_diff_all_invalid_patterns_are_rejected() {
         let diff = "diff --git a/test.rs b/test.rs\n+code\n";
-        // All patterns are invalid - should return full diff
         let patterns = vec!["[invalid".to_string(), "[also[bad".to_string()];
-        let filtered = filter_diff_by_globs(diff, &[], &patterns);
-        assert_eq!(filtered, diff);
+        assert!(filter_diff_by_globs(diff, &[], &patterns).is_err());
     }
 
     #[test]
     fn test_filter_diff_empty_diff() {
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs("", &[], &patterns);
-        assert_eq!(filtered, "");
+        assert!(filter_diff_by_globs("", &[], &patterns).is_err());
     }
 
     #[test]
@@ -670,9 +884,7 @@ mod tests {
         // Content without proper diff header
         let content = "just some random text\nwithout diff headers";
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(content, &[], &patterns);
-        // Should keep content since no diff header matched
-        assert!(filtered.contains("random text"));
+        assert!(filter_diff_by_globs(content, &[], &patterns).is_err());
     }
 
     #[test]
@@ -680,9 +892,7 @@ mod tests {
         // Diff header without proper format
         let diff = "diff --git \n+something\n";
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &[], &patterns);
-        // Should keep since filename extraction fails and defaults to include
-        assert!(filtered.contains("something"));
+        assert!(filter_diff_by_globs(diff, &[], &patterns).is_err());
     }
 
     #[test]
@@ -736,8 +946,8 @@ mod tests {
     fn test_filter_diff_single_file_excluded() {
         let diff = "diff --git a/config.json b/config.json\n+{}\n";
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &[], &patterns);
-        assert!(filtered.is_empty() || !filtered.contains("config.json"));
+        let error = filter_diff_by_globs(diff, &[], &patterns).unwrap_err();
+        assert!(error.to_string().contains("All changed files"));
     }
 
     #[test]
@@ -752,7 +962,7 @@ mod tests {
  }
 "#;
         let patterns = vec!["*.json".to_string()]; // Won't match .rs
-        let filtered = filter_diff_by_globs(diff, &[], &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns).unwrap();
         assert!(filtered.contains("fn main()"));
         assert!(filtered.contains("println!"));
         assert!(filtered.contains("old_code"));
@@ -768,7 +978,7 @@ diff --git a/c.rs b/c.rs
 +third
 "#;
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &[], &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns).unwrap();
         assert!(!filtered.contains("first"));
         assert!(!filtered.contains("second"));
         assert!(filtered.contains("third"));
@@ -819,7 +1029,7 @@ diff --git a/src/app.ts b/src/app.ts
 +// TypeScript code
 "#;
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &[], &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns).unwrap();
 
         assert!(filtered.contains("readme.md"));
         assert!(filtered.contains("Documentation"));
@@ -832,7 +1042,7 @@ diff --git a/src/app.ts b/src/app.ts
     fn test_filter_diff_special_characters_in_path() {
         let diff = "diff --git a/path with spaces/file.rs b/path with spaces/file.rs\n+code\n";
         let patterns = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &[], &patterns);
+        let filtered = filter_diff_by_globs(diff, &[], &patterns).unwrap();
         assert!(filtered.contains("code"));
     }
 
@@ -854,7 +1064,7 @@ diff --git a/src/app.ts b/src/app.ts
         let diff = "diff --git a/data.xml b/data.xml\n+<root/>\n";
         let include = vec!["*.xml".to_string()];
         let exclude = vec!["*.xml".to_string()];
-        let filtered = filter_diff_by_globs(diff, &include, &exclude);
+        let filtered = filter_diff_by_globs(diff, &include, &exclude).unwrap();
         assert!(filtered.contains("data.xml"));
         assert!(filtered.contains("<root/>"));
     }
@@ -863,16 +1073,15 @@ diff --git a/src/app.ts b/src/app.ts
     fn test_filter_diff_extra_exclude_drops_file() {
         let diff = "diff --git a/schema.sql b/schema.sql\n+CREATE TABLE x;\n";
         let exclude = vec!["*.sql".to_string()];
-        let filtered = filter_diff_by_globs(diff, &[], &exclude);
-        assert!(!filtered.contains("schema.sql"));
-        assert!(!filtered.contains("CREATE TABLE"));
+        let error = filter_diff_by_globs(diff, &[], &exclude).unwrap_err();
+        assert!(error.to_string().contains("All changed files"));
     }
 
     #[test]
     fn test_filter_diff_empty_include_matches_legacy_behavior() {
         let diff = "diff --git a/a.json b/a.json\n+{}\ndiff --git a/b.rs b/b.rs\n+code\n";
         let exclude = vec!["*.json".to_string()];
-        let filtered = filter_diff_by_globs(diff, &[], &exclude);
+        let filtered = filter_diff_by_globs(diff, &[], &exclude).unwrap();
         assert!(!filtered.contains("a.json"));
         assert!(filtered.contains("b.rs"));
     }
@@ -882,7 +1091,37 @@ diff --git a/src/app.ts b/src/app.ts
         let diff = "diff --git a/keep.xml b/keep.xml\n+<a/>\n";
         let include = vec!["keep.xml".to_string()];
         let exclude = vec!["*.xml".to_string()];
-        let filtered = filter_diff_by_globs(diff, &include, &exclude);
+        let filtered = filter_diff_by_globs(diff, &include, &exclude).unwrap();
         assert!(filtered.contains("keep.xml"));
+    }
+
+    #[test]
+    fn test_filter_diff_matches_repository_relative_directory_glob() {
+        let diff = "diff --git a/generated/private/data.txt b/generated/private/data.txt\n+secret\ndiff --git a/src/data.txt b/src/data.txt\n+safe\n";
+        let excluded = vec!["generated/**".to_string()];
+        let filtered = filter_diff_by_globs(diff, &[], &excluded).unwrap();
+        assert!(!filtered.contains("generated/private"));
+        assert!(filtered.contains("src/data.txt"));
+    }
+
+    #[test]
+    fn test_filter_diff_parses_quoted_paths() {
+        let diff =
+            "diff --git \"a/path with spaces/data.json\" \"b/path with spaces/data.json\"\n+{}\n";
+        let excluded = vec!["path with spaces/**".to_string()];
+        assert!(filter_diff_by_globs(diff, &[], &excluded).is_err());
+    }
+
+    #[test]
+    fn test_diff_safety_detects_sensitive_paths_and_secret_additions() {
+        let diff = "diff --git a/.env b/.env\n+API_KEY=abcdefghijklmnop1234\n";
+        let files = vec![".env".to_string(), "src/lib.rs".to_string()];
+        let patterns = vec![".env".to_string()];
+        let report = assess_diff_safety(diff, &files, &patterns).unwrap();
+        assert_eq!(report.sensitive_files, vec![".env"]);
+        assert_eq!(report.omitted_files, vec!["src/lib.rs"]);
+        assert!(report
+            .secret_findings
+            .contains(&"secret-like assignment".to_string()));
     }
 }

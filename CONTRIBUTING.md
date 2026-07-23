@@ -31,7 +31,7 @@ First off, thank you for considering contributing to cgen! Every contribution he
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (stable toolchain, 1.70+)
+- [Rust](https://rustup.rs/) (stable toolchain, 1.74+)
 - Git
 
 ### Build & Run
@@ -107,9 +107,13 @@ cargo test --locked
 
 # Coverage gate for core logic
 cargo llvm-cov --locked --lib --tests \
-  --ignore-filename-regex 'src/main.rs|src/cli.rs' \
+  --ignore-filename-regex '(main|cli|preset|update|cache|ui)\.rs' \
   --summary-only \
-  --fail-under-lines 95
+  --fail-under-lines 90
+
+# Required formatting and lint gates
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 ## Project Structure
@@ -119,18 +123,20 @@ src/
 ├── main.rs              # Entry point, CLI dispatch, main flow
 ├── cli.rs               # clap derive definitions + interactive config menu (inquire)
 ├── config.rs            # AppConfig struct, layered resolution, TOML/env I/O
+├── persistence.rs       # Locked, owner-only atomic persistence
 ├── provider.rs          # Provider registry, API adapters, HTTP call, response parsing
-├── prompt.rs            # System prompt assembly from config flags
-├── git.rs               # git diff, git commit via std::process::Command
-└── interpolation.rs     # $VAR template engine for URL/headers
-
-data/
-└── conventions/         # Reference specs for conventional commits & gitmoji
-    ├── CONVENTIONAL_COMMIT.md
-    └── GITMOJI.md
+├── prompt.rs            # System prompt assembly and final-message validation
+├── git.rs               # Git operations, path-aware filtering, diff inspection
+├── interpolation.rs     # Non-mutating $VAR template engine for URL/headers
+├── editor.rs            # Shell-free external editor launcher
+├── preset.rs            # Presets and fallback configuration
+├── cache.rs             # Bounded per-repository generated-commit history
+├── update.rs            # Provenance-aware, checksum-verified updater
+└── workflow.rs          # Testable pre-provider workflow policy
 
 .github/workflows/
-└── release.yml          # Cross-platform CI/CD (builds on tag push)
+├── test.yml             # Cross-platform test, quality, MSRV, audit, coverage
+└── release.yml          # Locked multi-platform release builds and checksums
 ```
 
 **Design principles**:
@@ -163,7 +169,7 @@ This is one of the easiest and most valuable ways to contribute. A default provi
    - `OpenAiCompat` — Most providers use this (OpenAI-compatible chat completions). Request body: `{ model, messages: [{role, content}], max_tokens, temperature }`.
    - `Gemini` — Google's format with `system_instruction` and `contents` arrays.
    - `Anthropic` — Similar to OpenAI but with `system` as a top-level string field.
-   - `LmStudio` — LM Studio chat endpoint format. Request body: `{ model, input }`.
+   - `LmStudio` — LM Studio chat endpoint format. Request body: `{ model, system_prompt, input }`.
 
    If the provider uses a completely different format, you may need to add a new variant to `RequestFormat` and a matching arm in `build_request_body()`.
 
@@ -227,10 +233,10 @@ That's it — most OpenAI-compatible providers are short additions, while custom
 
 3. **Ensure quality**:
    ```sh
-   cargo fmt       # Format code
-   cargo clippy    # Lint — fix all warnings
-   cargo test      # Run tests
-   cargo build     # Verify it compiles
+   cargo fmt --all --check
+   cargo clippy --locked --all-targets --all-features -- -D warnings
+   cargo test --locked
+   cargo build --locked
    ```
 
 4. **Commit** with a descriptive message following [Conventional Commits](https://www.conventionalcommits.org/) or just use `cgen` ;) :

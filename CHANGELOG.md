@@ -11,18 +11,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `--set KEY=VALUE` flag to override any setting for a single run (ephemeral, never persisted); `auto_update` excepted
 - `--diff-include GLOB` / `--diff-exclude GLOB` flags to refine which files are sent to the LLM for a single run (allow-over-deny precedence)
+- Sparse project `.env` overrides with an interactive “Inherit global value” action
+- Configurable diff byte/sensitive-path guards and explicit `--allow-large-diff` / `--allow-sensitive` overrides
+- Linux ARM64 and x86_64 musl release artifacts with SHA-256 manifests
+- Rust 1.74 MSRV declaration and CI gate
 
 ### Changed
 
-- 
+- Local `.env` updates preserve unrelated variables, comments, and absent inherited settings
+- Configuration parsing rejects invalid booleans, integers, push modes, gitmoji formats, templates, locales, headers, and globs
+- Provider fallbacks share one total deadline and run only for classified transient failures
+- Preset/config/cache writes are owner-only, lock-protected, and atomically replaced
+- History cache entries use stable identifiers, deduplicate rewrites, and retain the latest 200 commits
+- Self-update targets the current installation, pins the release version, and verifies checksums before replacement
+- Release CI builds with `--locked`, validates the requested tag, publishes checksums, and gates crates.io publication behind the release
+- CI now enforces formatting, strict Clippy, cross-platform tests, MSRV, dependency audit, installer syntax, and aligned coverage
+- Locked dependencies use patched TLS, error-handling, randomness, and test-serialization releases; terminal UI features avoid unnecessary unmaintained/yanked transitive paths while preserving Rust 1.74 support
 
 ### Fixed
 
--
+- Partial global TOML files no longer turn omitted default-true booleans off
+- Unicode API keys/prompts no longer panic during masking or truncation
+- Interpolation no longer mutates process environment or silently removes missing variables
+- Confirmation cancellation can no longer select an affirmative default
+- LM Studio receives the complete system instruction
+- Empty, malformed, fully excluded, oversized, or sensitive diffs are stopped before provider calls
+- Generated, regenerated, templated, and manually edited commit messages are validated before Git receives them
+- Non-HEAD/root rewrites record the rewritten commit identity rather than HEAD
+- Root-commit undo keeps changes staged
+- Pushed rewrites use an explicit force-with-lease path and created tags are pushed explicitly
+- Selected-repository history uses that repository for `git show`
+- Concurrent preset/cache writes no longer silently overwrite one another
+- The updater uses the published `auto-commit-rs` crate rather than a nonexistent package
 
 ### Removed
 
--
+- High-MSRV `edit` dependency; editor launching is handled internally
 
 ## [1.3.1] - 2026-04-09
 

@@ -2,8 +2,8 @@ mod common;
 
 use auto_commit_rs::preset::{
     create_preset, delete_preset, duplicate_preset, export_presets, find_duplicate, import_presets,
-    load_presets, rename_preset, save_presets, FallbackConfig, LlmPresetFields, Preset,
-    PresetsFile,
+    load_presets, rename_preset, save_presets, update_presets, FallbackConfig, LlmPresetFields,
+    Preset, PresetsFile,
 };
 use common::EnvGuard;
 use serial_test::serial;
@@ -45,7 +45,7 @@ fn save_and_load_presets_roundtrip() {
     let mut file = PresetsFile::default();
     create_preset(&mut file, Some("Test Preset".into()), sample_fields());
 
-    save_presets(&file).expect("save_presets should succeed");
+    save_presets(&mut file).expect("save_presets should succeed");
 
     // Verify file was created
     let presets_path = cfg_dir.path().join("cgen").join("presets.toml");
@@ -65,7 +65,7 @@ fn save_presets_atomic_write() {
 
     let mut file = PresetsFile::default();
     create_preset(&mut file, None, sample_fields());
-    save_presets(&file).expect("first save");
+    save_presets(&mut file).expect("first save");
 
     // Modify and save again
     create_preset(
@@ -76,7 +76,7 @@ fn save_presets_atomic_write() {
             ..sample_fields()
         },
     );
-    save_presets(&file).expect("second save");
+    save_presets(&mut file).expect("second save");
 
     // Verify no temp files left behind
     let cgen_dir = cfg_dir.path().join("cgen");
@@ -248,4 +248,68 @@ fn fallback_order_manipulation() {
     // Delete first preset should remove from fallback order
     delete_preset(&mut file, id1);
     assert_eq!(file.fallback.order, vec![id2]);
+}
+
+#[test]
+#[serial]
+fn concurrent_preset_updates_keep_unique_stable_ids() {
+    let (_cfg_dir, _env) = setup_presets_env();
+    std::thread::scope(|scope| {
+        for index in 0..8 {
+            scope.spawn(move || {
+                update_presets(|file| {
+                    create_preset(
+                        file,
+                        Some(format!("Preset {index}")),
+                        LlmPresetFields {
+                            model: format!("model-{index}"),
+                            ..sample_fields()
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            });
+        }
+    });
+
+    let file = load_presets().unwrap();
+    assert_eq!(file.presets.len(), 8);
+    let mut ids: Vec<u32> = file.presets.iter().map(|preset| preset.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 8);
+    assert!(file.next_id > *ids.last().unwrap());
+}
+
+#[test]
+#[serial]
+fn stale_preset_save_is_rejected() {
+    let (_cfg_dir, _env) = setup_presets_env();
+    let mut first = load_presets().unwrap();
+    let mut stale = load_presets().unwrap();
+    create_preset(&mut first, Some("first".into()), sample_fields());
+    save_presets(&mut first).unwrap();
+    create_preset(&mut stale, Some("stale".into()), sample_fields());
+    assert!(save_presets(&mut stale)
+        .unwrap_err()
+        .to_string()
+        .contains("changed in another process"));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn presets_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (cfg_dir, _env) = setup_presets_env();
+    let mut file = PresetsFile::default();
+    create_preset(&mut file, None, sample_fields());
+    save_presets(&mut file).unwrap();
+    let path = cfg_dir.path().join("cgen/presets.toml");
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

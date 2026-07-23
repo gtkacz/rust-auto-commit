@@ -65,3 +65,27 @@ fn set_with_alter_subcommand_dispatches() {
         other => panic!("expected Alter subcommand, got {other:?}"),
     }
 }
+
+#[test]
+fn global_generation_flags_parse_after_subcommand() {
+    let cli = Cli::try_parse_from([
+        "cgen",
+        "alter",
+        "abc123",
+        "--dry-run",
+        "--verbose",
+        "--set",
+        "model=x",
+        "--diff-include",
+        "*.rs",
+        "--allow-large-diff",
+        "--allow-sensitive",
+    ])
+    .expect("global flags should parse after a subcommand");
+    assert!(cli.dry_run);
+    assert!(cli.verbose);
+    assert_eq!(cli.set, vec!["model=x"]);
+    assert_eq!(cli.diff_include, vec!["*.rs"]);
+    assert!(cli.allow_large_diff);
+    assert!(cli.allow_sensitive);
+}

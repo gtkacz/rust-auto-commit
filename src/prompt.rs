@@ -1,4 +1,7 @@
 use crate::config::AppConfig;
+use anyhow::Result;
+use regex_lite::Regex;
+use std::sync::OnceLock;
 
 const CONVENTIONAL_COMMIT_SPEC: &str = "\
 Write all commit messages strictly following the Conventional Commits specification.
@@ -91,6 +94,59 @@ pub fn clean_commit_message(raw: &str) -> String {
     let s = strip_surrounding_quotes(s);
 
     s.trim().to_string()
+}
+
+/// Validate the exact message that would be handed to Git.
+pub fn validate_commit_message(message: &str, cfg: &AppConfig) -> Result<()> {
+    let message = message.trim();
+    if message.is_empty() {
+        anyhow::bail!("Commit message is empty");
+    }
+    if message.contains('\0') {
+        anyhow::bail!("Commit message contains a NUL byte");
+    }
+    if cfg.one_liner && message.lines().count() != 1 {
+        anyhow::bail!("One-liner mode requires exactly one line");
+    }
+
+    let first_line = message.lines().next().expect("non-empty message");
+    let conventional = if cfg.use_gitmoji {
+        strip_required_gitmoji(first_line, &cfg.gitmoji_format)?
+    } else {
+        first_line
+    };
+    static CONVENTIONAL: OnceLock<Regex> = OnceLock::new();
+    let conventional_re = CONVENTIONAL
+        .get_or_init(|| Regex::new(r"^[a-z][a-z0-9-]*(\([^()\r\n]+\))?!?: .*\S$").unwrap());
+    if !conventional_re.is_match(conventional) {
+        anyhow::bail!(
+            "Commit message must start with a Conventional Commit header such as 'feat: add login'"
+        );
+    }
+    Ok(())
+}
+
+fn strip_required_gitmoji<'a>(line: &'a str, format: &str) -> Result<&'a str> {
+    let (prefix, message) = line
+        .split_once(' ')
+        .ok_or_else(|| anyhow::anyhow!("Gitmoji messages must start with an emoji and a space"))?;
+    match format {
+        "shortcode"
+            if prefix.len() > 2
+                && prefix.starts_with(':')
+                && prefix.ends_with(':')
+                && prefix[1..prefix.len() - 1]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+        {
+            Ok(message)
+        }
+        "unicode" if !prefix.is_ascii() => Ok(message),
+        "shortcode" => {
+            anyhow::bail!("Gitmoji shortcode format requires a prefix such as ':sparkles:'")
+        }
+        _ => anyhow::bail!("Gitmoji unicode format requires an emoji prefix"),
+    }
 }
 
 fn strip_code_fence(s: &str) -> &str {

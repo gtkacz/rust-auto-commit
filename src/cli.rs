@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use inquire::{Select, Text};
+use inquire::{Password, Select, Text};
 
 use crate::config::AppConfig;
 use crate::preset::LlmPresetFields;
@@ -21,32 +21,40 @@ pub struct Cli {
     pub command: Option<Command>,
 
     /// Generate and print commit message without creating a commit
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub dry_run: bool,
 
     /// Print the final system prompt sent to the LLM (without diff payload)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub verbose: bool,
 
     /// Create a semantic version tag after a successful commit
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub tag: bool,
 
     /// Override any setting for this run only (repeatable). Format: KEY=VALUE,
     /// e.g. --set model=gpt-4o --set one_liner=false. Keys are case-insensitive
     /// and accept '-' or '_'. Never persisted. `auto_update` cannot be overridden.
-    #[arg(long, value_name = "KEY=VALUE")]
+    #[arg(long, value_name = "KEY=VALUE", global = true)]
     pub set: Vec<String>,
 
     /// Force-include files matching GLOB in the diff sent to the LLM, even if an
     /// exclude pattern would drop them (repeatable). Quote globs: --diff-include "*.xml"
-    #[arg(long, value_name = "GLOB")]
+    #[arg(long, value_name = "GLOB", global = true)]
     pub diff_include: Vec<String>,
 
     /// Additionally exclude files matching GLOB from the diff sent to the LLM for
     /// this run (repeatable). Quote globs: --diff-exclude "*.sql"
-    #[arg(long, value_name = "GLOB")]
+    #[arg(long, value_name = "GLOB", global = true)]
     pub diff_exclude: Vec<String>,
+
+    /// Allow a diff that exceeds max_diff_bytes to be sent to the configured LLM
+    #[arg(long, global = true)]
+    pub allow_large_diff: bool,
+
+    /// Allow sensitive paths or high-confidence secret patterns in the LLM payload
+    #[arg(long, global = true)]
+    pub allow_sensitive: bool,
 
     /// Extra arguments forwarded to `git commit`
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -95,7 +103,12 @@ enum MenuAction {
 }
 
 pub fn interactive_config(global: bool) -> Result<()> {
-    let mut cfg = AppConfig::load()?;
+    let (mut cfg, inherited, mut explicit_fields) = if global {
+        (AppConfig::load_global_for_edit()?, None, HashSet::new())
+    } else {
+        let state = AppConfig::load_local_for_edit()?;
+        (state.config, Some(state.inherited), state.explicit_fields)
+    };
     let scope = if global { "global" } else { "local" };
 
     println!("\n{}  {} configuration\n", "cgen".cyan().bold(), scope);
@@ -147,13 +160,18 @@ pub fn interactive_config(global: bool) -> Result<()> {
 
             let has_subgroups = !group.subgroups.is_empty();
             for (i, (display_name, suffix, val)) in group.fields.iter().enumerate() {
+                if !global && *suffix == "AUTO_UPDATE" {
+                    continue;
+                }
                 let is_last = !has_subgroups && i == group.fields.len() - 1;
                 let conn = if is_last {
                     "\u{2514}\u{2500}\u{2500}"
                 } else {
                     "\u{251C}\u{2500}\u{2500}"
                 };
-                let mut field_label = format!("  {} {:<22} {}", conn, display_name, val.dimmed());
+                let source = field_source_label(val, suffix, global, &explicit_fields);
+                let mut field_label =
+                    format!("  {} {:<22} {}", conn, display_name, source.dimmed());
                 if show_descriptions {
                     let desc = crate::config::field_description(suffix);
                     if !desc.is_empty() {
@@ -187,18 +205,22 @@ pub fn interactive_config(global: bool) -> Result<()> {
 
                 let pipe = if is_last_sg { " " } else { "\u{2502}" };
                 for (f_idx, (display_name, suffix, val)) in sg.fields.iter().enumerate() {
+                    if !global && *suffix == "AUTO_UPDATE" {
+                        continue;
+                    }
                     let is_last_field = f_idx == sg.fields.len() - 1;
                     let f_conn = if is_last_field {
                         "\u{2514}\u{2500}\u{2500}"
                     } else {
                         "\u{251C}\u{2500}\u{2500}"
                     };
+                    let source = field_source_label(val, suffix, global, &explicit_fields);
                     let mut field_label = format!(
                         "  {}   {} {:<22} {}",
                         pipe,
                         f_conn,
                         display_name,
-                        val.dimmed()
+                        source.dimmed()
                     );
                     if show_descriptions {
                         let desc = crate::config::field_description(suffix);
@@ -288,7 +310,7 @@ pub fn interactive_config(global: bool) -> Result<()> {
                     .unwrap_or_default();
                 println!("\n{} Saved to {}", "done!".green().bold(), path.dimmed());
             } else {
-                cfg.save_local()?;
+                cfg.save_local_overrides(&explicit_fields)?;
                 println!("\n{} Saved to {}", "done!".green().bold(), ".env".dimmed());
             }
             break;
@@ -328,15 +350,46 @@ pub fn interactive_config(global: bool) -> Result<()> {
                 cursor_target = Some(name);
             }
             MenuAction::EditField(suffix) => {
+                if !global {
+                    let action = if explicit_fields.contains(*suffix) {
+                        Select::new(
+                            "Local setting:",
+                            vec!["Edit local override", "Inherit global value", "Cancel"],
+                        )
+                        .prompt()
+                        .ok()
+                    } else {
+                        Select::new("Local setting:", vec!["Add local override", "Cancel"])
+                            .prompt()
+                            .ok()
+                    };
+                    match action {
+                        Some("Inherit global value") => {
+                            if let Some(parent) = inherited.as_ref() {
+                                cfg.inherit_field(suffix, parent)?;
+                            }
+                            explicit_fields.remove(*suffix);
+                            continue;
+                        }
+                        Some("Edit local override") | Some("Add local override") => {}
+                        _ => continue,
+                    }
+                }
                 let new_value = edit_field(suffix, &cfg);
                 if let Some(val) = new_value {
                     if let Err(err) = cfg.set_field(suffix, &val) {
                         println!("  {} {}", "error:".red().bold(), err);
                         continue;
                     }
+                    if !global {
+                        explicit_fields.insert((*suffix).to_string());
+                    }
                     if *suffix == "PROVIDER" {
                         let default_model = crate::provider::default_model_for(&val);
                         cfg.set_field("MODEL", default_model)?;
+                        if !global {
+                            explicit_fields.insert("MODEL".to_string());
+                        }
                         if default_model.is_empty() {
                             println!(
                                 "  {} Model cleared (set it manually)",
@@ -359,6 +412,13 @@ pub fn interactive_config(global: bool) -> Result<()> {
                 Ok(Some((id, snapshot))) => {
                     loaded_preset_id = Some(id);
                     loaded_preset_snapshot = Some(snapshot);
+                    if !global {
+                        explicit_fields.extend(
+                            ["PROVIDER", "MODEL", "API_KEY", "API_URL", "API_HEADERS"]
+                                .into_iter()
+                                .map(str::to_string),
+                        );
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => println!("  {} {}", "error:".red().bold(), e),
@@ -518,7 +578,7 @@ fn edit_field(suffix: &str, cfg: &AppConfig) -> Option<String> {
                 .ok()
                 .map(|v| if v == "enabled" { "1" } else { "0" }.to_string())
         }
-        "API_KEY" => Text::new("API Key:")
+        "API_KEY" => Password::new("API Key:")
             .with_help_message("Your LLM provider API key")
             .prompt()
             .ok(),
@@ -538,5 +598,18 @@ fn edit_field(suffix: &str, cfg: &AppConfig) -> Option<String> {
                 None => None,
             }
         }
+    }
+}
+
+fn field_source_label(
+    value: &str,
+    suffix: &str,
+    global: bool,
+    explicit_fields: &HashSet<String>,
+) -> String {
+    if !global && suffix != "AUTO_UPDATE" && !explicit_fields.contains(suffix) {
+        format!("{value} (inherited)")
+    } else {
+        value.to_string()
     }
 }

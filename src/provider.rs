@@ -2,10 +2,16 @@ use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
-use std::time::Duration;
+use std::io::Read;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 use crate::interpolation::interpolate;
+
+const TOTAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_RESPONSE_BYTES: usize = 1_048_576;
+const MAX_ERROR_BODY_BYTES: usize = 2_048;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RequestFormat {
@@ -157,6 +163,18 @@ pub enum LlmCallError {
     Other(anyhow::Error),
 }
 
+impl LlmCallError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::TransportError(_) => true,
+            Self::HttpError { code, .. } => {
+                matches!(*code, 408 | 409 | 425 | 429) || (500..=599).contains(code)
+            }
+            Self::Other(_) => false,
+        }
+    }
+}
+
 impl std::fmt::Display for LlmCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -173,15 +191,22 @@ fn call_llm_inner(
     cfg: &AppConfig,
     system_prompt: &str,
     diff: &str,
+    deadline: Instant,
 ) -> Result<String, LlmCallError> {
     let (url, headers_raw, format, response_path) =
         resolve_provider(cfg).map_err(LlmCallError::Other)?;
 
-    let url = interpolate(&url, cfg);
-    let headers_raw = interpolate(&headers_raw, cfg);
+    let url = interpolate(&url, cfg).map_err(LlmCallError::Other)?;
+    let headers_raw = interpolate(&headers_raw, cfg).map_err(LlmCallError::Other)?;
 
     let body = build_request_body(format, &cfg.model, system_prompt, diff);
-    let headers = parse_headers(&headers_raw);
+    let headers = parse_headers(&headers_raw).map_err(LlmCallError::Other)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(LlmCallError::TransportError(
+            "total request deadline exceeded".into(),
+        ));
+    }
 
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -192,10 +217,9 @@ fn call_llm_inner(
     spinner.set_message("Generating commit message...");
     spinner.enable_steady_tick(Duration::from_millis(80));
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(120))
-        .build();
-    let mut req = agent.post(&url);
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    let agent = AGENT.get_or_init(|| ureq::AgentBuilder::new().build());
+    let mut req = agent.post(&url).timeout(remaining);
     for (key, val) in &headers {
         req = req.set(key, val);
     }
@@ -208,31 +232,38 @@ fn call_llm_inner(
     let response = match response {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
+            let body = read_bounded(resp.into_reader(), MAX_ERROR_BODY_BYTES)
+                .unwrap_or_else(|_| "<response body unavailable>".into());
+            let body = redact(&body, &cfg.api_key);
             return Err(LlmCallError::HttpError { code, body });
         }
         Err(ureq::Error::Transport(t)) => {
-            return Err(LlmCallError::TransportError(t.to_string()));
+            return Err(LlmCallError::TransportError(redact(
+                &t.to_string(),
+                &cfg.api_key,
+            )));
         }
     };
 
-    let json: Value = response.into_json().map_err(|e| {
+    let response_body =
+        read_bounded(response.into_reader(), MAX_RESPONSE_BYTES).map_err(LlmCallError::Other)?;
+    let json: Value = serde_json::from_str(&response_body).map_err(|e| {
         LlmCallError::Other(anyhow::anyhow!("Failed to parse API response as JSON: {e}"))
     })?;
 
     let message = extract_message(&json, format, &response_path).map_err(|e| {
         LlmCallError::Other(anyhow::anyhow!(
-            "Failed to extract message from response at path '{}'. Response:\n{}\nError: {}",
+            "Failed to extract message from response at path '{}'. Response: {}\nError: {}",
             response_path,
-            serde_json::to_string_pretty(&json).unwrap_or_default(),
+            bounded_json_diagnostic(&json, &cfg.api_key),
             e
         ))
     })?;
 
     if message.trim().is_empty() {
         return Err(LlmCallError::Other(anyhow::anyhow!(
-            "LLM returned an empty commit message. Full response:\n{}",
-            serde_json::to_string_pretty(&json).unwrap_or_default()
+            "LLM returned an empty commit message. Response: {}",
+            bounded_json_diagnostic(&json, &cfg.api_key)
         )));
     }
 
@@ -245,27 +276,24 @@ pub fn call_llm_with_fallback(
     system_prompt: &str,
     diff: &str,
 ) -> Result<(String, Option<String>)> {
-    match call_llm_inner(cfg, system_prompt, diff) {
+    let deadline = Instant::now() + TOTAL_REQUEST_TIMEOUT;
+    match call_llm_inner(cfg, system_prompt, diff, deadline) {
         Ok(msg) => Ok((msg, None)),
-        Err(LlmCallError::TransportError(msg)) => {
-            anyhow::bail!("Network error: {msg}");
-        }
-        Err(LlmCallError::HttpError { code, body }) => {
-            if !cfg.fallback_enabled {
-                anyhow::bail!("API returned HTTP {code}: {body}");
+        Err(primary_error) => {
+            if !cfg.fallback_enabled || !primary_error.is_retryable() {
+                anyhow::bail!("{primary_error}");
             }
-
             let presets_file = match crate::preset::load_presets() {
                 Ok(f) => f,
-                Err(_) => anyhow::bail!("API returned HTTP {code}: {body}"),
+                Err(_) => anyhow::bail!("{primary_error}"),
             };
 
             if presets_file.fallback.order.is_empty() {
-                anyhow::bail!("API returned HTTP {code}: {body}");
+                anyhow::bail!("{primary_error}");
             }
 
             let current_fields = crate::preset::fields_from_config(cfg);
-            let mut errors = vec![format!("Primary (HTTP {code})")];
+            let mut errors = vec![format!("Primary ({primary_error})")];
 
             for &preset_id in &presets_file.fallback.order {
                 let preset = match presets_file.presets.iter().find(|p| p.id == preset_id) {
@@ -283,35 +311,28 @@ pub fn call_llm_with_fallback(
                 }
 
                 eprintln!(
-                    "{} Primary failed (HTTP {}), trying: {}...",
+                    "{} Primary failed, trying: {}...",
                     "fallback:".yellow().bold(),
-                    code,
                     preset.name
                 );
 
                 let mut temp_cfg = cfg.clone();
                 crate::preset::apply_preset_to_config(&mut temp_cfg, preset);
 
-                match call_llm_inner(&temp_cfg, system_prompt, diff) {
+                match call_llm_inner(&temp_cfg, system_prompt, diff, deadline) {
                     Ok(msg) => return Ok((msg, Some(preset.name.clone()))),
-                    Err(LlmCallError::HttpError { code: fc, .. }) => {
-                        errors.push(format!("{} (HTTP {fc})", preset.name));
-                        continue;
-                    }
-                    Err(LlmCallError::TransportError(msg)) => {
-                        anyhow::bail!("Network error during fallback to '{}': {msg}", preset.name);
-                    }
-                    Err(LlmCallError::Other(e)) => {
-                        errors.push(format!("{} ({})", preset.name, e));
-                        continue;
+                    Err(error) => {
+                        let retryable = error.is_retryable();
+                        errors.push(format!("{} ({error})", preset.name));
+                        if retryable {
+                            continue;
+                        }
+                        anyhow::bail!("LLM fallback stopped: {}", errors.join(", "));
                     }
                 }
             }
 
             anyhow::bail!("All LLM providers failed: {}", errors.join(", "));
-        }
-        Err(LlmCallError::Other(e)) => {
-            anyhow::bail!("{e}");
         }
     }
 }
@@ -400,6 +421,7 @@ fn build_request_body(
         RequestFormat::LmStudio => {
             serde_json::json!({
                 "model": model,
+                "system_prompt": system_prompt,
                 "input": diff
             })
         }
@@ -407,17 +429,86 @@ fn build_request_body(
 }
 
 /// Parse "Key: Value, Key2: Value2" header string into pairs
-fn parse_headers(raw: &str) -> Vec<(String, String)> {
+fn parse_headers(raw: &str) -> Result<Vec<(String, String)>> {
     if raw.trim().is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+    if raw.trim_start().starts_with('{') {
+        let value: Value = serde_json::from_str(raw).context("Invalid API headers JSON")?;
+        let object = value
+            .as_object()
+            .context("API headers JSON must be an object")?;
+        return object
+            .iter()
+            .map(|(key, value)| {
+                let value = value
+                    .as_str()
+                    .context("API header values must be strings")?;
+                validate_header(key, value)?;
+                Ok((key.clone(), value.to_string()))
+            })
+            .collect();
     }
     raw.split(',')
-        .filter_map(|pair| {
-            let pair = pair.trim();
-            pair.split_once(':')
-                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .map(|pair| {
+            let (key, value) = pair
+                .trim()
+                .split_once(':')
+                .context("Expected API header in 'Name: Value' format")?;
+            let key = key.trim();
+            let value = value.trim();
+            validate_header(key, value)?;
+            Ok((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+fn validate_header(key: &str, value: &str) -> Result<()> {
+    if key.is_empty()
+        || value.is_empty()
+        || key.chars().any(char::is_control)
+        || value.chars().any(char::is_control)
+    {
+        bail!("API header names and values must be non-empty single-line text");
+    }
+    Ok(())
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("Failed to read API response")?;
+    if bytes.len() > limit {
+        bail!("API response exceeded the {limit}-byte safety limit");
+    }
+    String::from_utf8(bytes).context("API response was not valid UTF-8")
+}
+
+fn redact(value: &str, api_key: &str) -> String {
+    if api_key.is_empty() {
+        value.to_string()
+    } else {
+        value.replace(api_key, "[REDACTED]")
+    }
+}
+
+fn bounded_json_diagnostic(value: &Value, api_key: &str) -> String {
+    let serialized = serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".into());
+    let redacted = redact(&serialized, api_key);
+    if redacted.chars().count() <= MAX_ERROR_BODY_BYTES {
+        redacted
+    } else {
+        format!(
+            "{}…",
+            redacted
+                .chars()
+                .take(MAX_ERROR_BODY_BYTES)
+                .collect::<String>()
+        )
+    }
 }
 
 /// Walk a JSON value by a dot-separated path like "candidates.0.content.parts.0.text"
@@ -469,13 +560,13 @@ mod tests {
 
     #[test]
     fn test_parse_headers_empty() {
-        assert!(parse_headers("").is_empty());
-        assert!(parse_headers("   ").is_empty());
+        assert!(parse_headers("").unwrap().is_empty());
+        assert!(parse_headers("   ").unwrap().is_empty());
     }
 
     #[test]
     fn test_parse_headers_single() {
-        let headers = parse_headers("Authorization: Bearer abc123");
+        let headers = parse_headers("Authorization: Bearer abc123").unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "Authorization");
         assert_eq!(headers[0].1, "Bearer abc123");
@@ -483,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_parse_headers_multiple() {
-        let headers = parse_headers("X-Api-Key: key123, Content-Type: application/json");
+        let headers = parse_headers("X-Api-Key: key123, Content-Type: application/json").unwrap();
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].0, "X-Api-Key");
         assert_eq!(headers[0].1, "key123");
@@ -493,18 +584,22 @@ mod tests {
 
     #[test]
     fn test_parse_headers_trims_whitespace() {
-        let headers = parse_headers("  Key  :  Value  ");
+        let headers = parse_headers("  Key  :  Value  ").unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "Key");
         assert_eq!(headers[0].1, "Value");
     }
 
     #[test]
-    fn test_parse_headers_skips_invalid() {
-        let headers = parse_headers("Valid: Header, InvalidNoColon, Another: One");
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0].0, "Valid");
-        assert_eq!(headers[1].0, "Another");
+    fn test_parse_headers_rejects_invalid() {
+        assert!(parse_headers("Valid: Header, InvalidNoColon, Another: One").is_err());
+    }
+
+    #[test]
+    fn test_parse_headers_accepts_json_object() {
+        let headers = parse_headers(r#"{"Authorization":"Bearer key","X-Mode":"safe"}"#).unwrap();
+        assert!(headers.contains(&("Authorization".into(), "Bearer key".into())));
+        assert!(headers.contains(&("X-Mode".into(), "safe".into())));
     }
 
     #[test]
@@ -637,6 +732,7 @@ mod tests {
             "user diff",
         );
         assert_eq!(body["model"], "qwen/qwen3.5-35b-a3b");
+        assert_eq!(body["system_prompt"], "system prompt");
         assert_eq!(body["input"], "user diff");
         assert!(body.get("messages").is_none());
     }

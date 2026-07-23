@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 pub struct FieldSubgroup {
     pub name: &'static str,
@@ -18,7 +18,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are to act as an author of a commit mes
 Your mission is to create clean and comprehensive commit messages as per
 the Conventional Commit specification and explain WHAT were the changes and mainly WHY the changes were done.
 I'll send you an output of 'git diff --staged' command, and you are to convert
-it into a commit message. Use the present tense. Use english for the commit message.";
+it into a commit message. Use the present tense.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -64,6 +64,48 @@ pub struct AppConfig {
     pub track_generated_commits: bool,
     #[serde(default = "default_diff_exclude_globs")]
     pub diff_exclude_globs: Vec<String>,
+    #[serde(default = "default_max_diff_bytes")]
+    pub max_diff_bytes: usize,
+    #[serde(default = "default_sensitive_file_globs")]
+    pub sensitive_file_globs: Vec<String>,
+}
+
+/// A global configuration file is an overlay, not a second set of defaults.
+/// Keeping every field optional is what lets omitted TOML keys inherit the
+/// application default instead of deserializing as `false` or an empty value.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialAppConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    api_url: Option<String>,
+    api_headers: Option<String>,
+    locale: Option<String>,
+    one_liner: Option<bool>,
+    commit_template: Option<String>,
+    llm_system_prompt: Option<String>,
+    use_gitmoji: Option<bool>,
+    gitmoji_format: Option<String>,
+    review_commit: Option<bool>,
+    post_commit_push: Option<String>,
+    suppress_tool_output: Option<bool>,
+    warn_staged_files_enabled: Option<bool>,
+    warn_staged_files_threshold: Option<usize>,
+    confirm_new_version: Option<bool>,
+    auto_update: Option<bool>,
+    fallback_enabled: Option<bool>,
+    track_generated_commits: Option<bool>,
+    diff_exclude_globs: Option<Vec<String>>,
+    max_diff_bytes: Option<usize>,
+    sensitive_file_globs: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+pub struct LocalConfigState {
+    pub config: AppConfig,
+    pub inherited: AppConfig,
+    pub explicit_fields: HashSet<String>,
 }
 
 fn default_provider() -> String {
@@ -117,6 +159,24 @@ fn default_diff_exclude_globs() -> Vec<String> {
     .map(String::from)
     .collect()
 }
+fn default_max_diff_bytes() -> usize {
+    200_000
+}
+fn default_sensitive_file_globs() -> Vec<String> {
+    [
+        ".env",
+        ".env.*",
+        "*.pem",
+        "*.key",
+        "id_rsa",
+        "id_ed25519",
+        "*credentials*",
+        "*secrets*",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -142,6 +202,8 @@ impl Default for AppConfig {
             fallback_enabled: true,
             track_generated_commits: true,
             diff_exclude_globs: default_diff_exclude_globs(),
+            max_diff_bytes: default_max_diff_bytes(),
+            sensitive_file_globs: default_sensitive_file_globs(),
         }
     }
 }
@@ -169,30 +231,20 @@ const ENV_FIELD_MAP: &[(&str, &str)] = &[
     ("FALLBACK_ENABLED", "fallback_enabled"),
     ("TRACK_GENERATED_COMMITS", "track_generated_commits"),
     ("DIFF_EXCLUDE_GLOBS", "diff_exclude_globs"),
+    ("MAX_DIFF_BYTES", "max_diff_bytes"),
+    ("SENSITIVE_FILE_GLOBS", "sensitive_file_globs"),
 ];
 
 impl AppConfig {
     /// Load config with layered resolution: defaults → global TOML → local .env → env vars
     pub fn load() -> Result<Self> {
-        let mut cfg = Self::default();
-
-        // Layer 1: Global TOML
-        if let Some(path) = global_config_path() {
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)
-                    .with_context(|| format!("Failed to read {}", path.display()))?;
-                let file_cfg: AppConfig = toml::from_str(&content)
-                    .with_context(|| format!("Failed to parse {}", path.display()))?;
-                cfg.merge_from(&file_cfg);
-            }
-        }
+        let mut cfg = Self::load_global_for_edit()?;
 
         // Layer 2: Local .env (in git repo root)
-        if let Ok(root) = crate::git::find_repo_root() {
-            let env_path = PathBuf::from(&root).join(".env");
+        if let Some(env_path) = local_env_path() {
             if env_path.exists() {
                 let env_map = parse_dotenv(&env_path)?;
-                cfg.apply_env_map(&env_map, true);
+                cfg.apply_env_map(&env_map, true)?;
             }
         }
 
@@ -204,219 +256,148 @@ impl AppConfig {
                 env_map.insert(key, val);
             }
         }
-        cfg.apply_env_map(&env_map, false);
-        cfg.ensure_valid_locale()?;
+        cfg.apply_env_map(&env_map, false)?;
+        cfg.validate()?;
 
         Ok(cfg)
     }
 
-    fn merge_from(&mut self, other: &AppConfig) {
-        if !other.provider.is_empty() {
-            self.provider = other.provider.clone();
+    /// Load exactly the defaults and global file, without project or process
+    /// overlays. This prevents an editor save from materializing ephemeral values.
+    pub fn load_global_for_edit() -> Result<Self> {
+        let mut cfg = Self::default();
+        if let Some(path) = global_config_path() {
+            if path.exists() {
+                let content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read {}", path.display()))?;
+                let partial: PartialAppConfig = toml::from_str(&content)
+                    .with_context(|| format!("Failed to parse {}", path.display()))?;
+                cfg.apply_partial(partial);
+            }
         }
-        if !other.model.is_empty() {
-            self.model = other.model.clone();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Load the project overlay together with the values it inherits and the
+    /// exact fields explicitly present in `.env`.
+    pub fn load_local_for_edit() -> Result<LocalConfigState> {
+        let inherited = Self::load_global_for_edit()?;
+        let mut config = inherited.clone();
+        let mut explicit_fields = HashSet::new();
+
+        if let Some(path) = local_env_path() {
+            if path.exists() {
+                let map = parse_dotenv(&path)?;
+                for (suffix, _) in ENV_FIELD_MAP {
+                    if *suffix != "AUTO_UPDATE" && map.contains_key(&format!("ACR_{suffix}")) {
+                        explicit_fields.insert((*suffix).to_string());
+                    }
+                }
+                config.apply_env_map(&map, true)?;
+            }
         }
-        if !other.api_key.is_empty() {
-            self.api_key = other.api_key.clone();
+        config.validate()?;
+        Ok(LocalConfigState {
+            config,
+            inherited,
+            explicit_fields,
+        })
+    }
+
+    fn apply_partial(&mut self, partial: PartialAppConfig) {
+        macro_rules! apply {
+            ($($field:ident),+ $(,)?) => {
+                $(if let Some(value) = partial.$field {
+                    self.$field = value;
+                })+
+            };
         }
-        if !other.api_url.is_empty() {
-            self.api_url = other.api_url.clone();
-        }
-        if !other.api_headers.is_empty() {
-            self.api_headers = other.api_headers.clone();
-        }
-        if !other.locale.is_empty() {
-            self.locale = other.locale.clone();
-        }
-        self.one_liner = other.one_liner;
-        if !other.commit_template.is_empty() {
-            self.commit_template = other.commit_template.clone();
-        }
-        if !other.llm_system_prompt.is_empty() {
-            self.llm_system_prompt = other.llm_system_prompt.clone();
-        }
-        self.use_gitmoji = other.use_gitmoji;
-        if !other.gitmoji_format.is_empty() {
-            self.gitmoji_format = other.gitmoji_format.clone();
-        }
-        self.review_commit = other.review_commit;
-        if !other.post_commit_push.is_empty() {
-            self.post_commit_push = normalize_post_commit_push(&other.post_commit_push);
-        }
-        self.suppress_tool_output = other.suppress_tool_output;
-        self.warn_staged_files_enabled = other.warn_staged_files_enabled;
-        self.warn_staged_files_threshold = other.warn_staged_files_threshold;
-        self.confirm_new_version = other.confirm_new_version;
-        if other.auto_update.is_some() {
-            self.auto_update = other.auto_update;
-        }
-        self.fallback_enabled = other.fallback_enabled;
-        self.track_generated_commits = other.track_generated_commits;
-        if !other.diff_exclude_globs.is_empty() {
-            self.diff_exclude_globs = other.diff_exclude_globs.clone();
+        apply!(
+            provider,
+            model,
+            api_key,
+            api_url,
+            api_headers,
+            locale,
+            one_liner,
+            commit_template,
+            llm_system_prompt,
+            use_gitmoji,
+            gitmoji_format,
+            review_commit,
+            post_commit_push,
+            suppress_tool_output,
+            warn_staged_files_enabled,
+            warn_staged_files_threshold,
+            confirm_new_version,
+            fallback_enabled,
+            track_generated_commits,
+            diff_exclude_globs,
+            max_diff_bytes,
+            sensitive_file_globs,
+        );
+        if partial.auto_update.is_some() {
+            self.auto_update = partial.auto_update;
         }
     }
 
-    fn apply_env_map(&mut self, map: &HashMap<String, String>, from_local: bool) {
+    fn apply_env_map(&mut self, map: &HashMap<String, String>, from_local: bool) -> Result<()> {
         for (suffix, _field) in ENV_FIELD_MAP {
             let key = format!("ACR_{suffix}");
             if let Some(val) = map.get(&key) {
-                match *suffix {
-                    "PROVIDER" => self.provider = val.clone(),
-                    "MODEL" => self.model = val.clone(),
-                    "API_KEY" => self.api_key = val.clone(),
-                    "API_URL" => self.api_url = val.clone(),
-                    "API_HEADERS" => self.api_headers = val.clone(),
-                    "LOCALE" => self.locale = val.clone(),
-                    "ONE_LINER" => self.one_liner = val == "1" || val.eq_ignore_ascii_case("true"),
-                    "COMMIT_TEMPLATE" => self.commit_template = val.clone(),
-                    "LLM_SYSTEM_PROMPT" => self.llm_system_prompt = val.clone(),
-                    "USE_GITMOJI" => {
-                        self.use_gitmoji = val == "1" || val.eq_ignore_ascii_case("true")
-                    }
-                    "GITMOJI_FORMAT" => self.gitmoji_format = val.clone(),
-                    "REVIEW_COMMIT" => {
-                        self.review_commit = val == "1" || val.eq_ignore_ascii_case("true")
-                    }
-                    "POST_COMMIT_PUSH" => self.post_commit_push = normalize_post_commit_push(val),
-                    "SUPPRESS_TOOL_OUTPUT" => {
-                        self.suppress_tool_output = val == "1" || val.eq_ignore_ascii_case("true")
-                    }
-                    "WARN_STAGED_FILES_ENABLED" => {
-                        self.warn_staged_files_enabled =
-                            val == "1" || val.eq_ignore_ascii_case("true")
-                    }
-                    "WARN_STAGED_FILES_THRESHOLD" => {
-                        self.warn_staged_files_threshold =
-                            parse_usize_or_default(val, default_warn_staged_files_threshold());
-                    }
-                    "CONFIRM_NEW_VERSION" => {
-                        self.confirm_new_version = val == "1" || val.eq_ignore_ascii_case("true")
-                    }
-                    "AUTO_UPDATE" => {
-                        // auto_update is global-only; skip when reading from local .env
-                        if !from_local {
-                            self.auto_update = Some(val == "1" || val.eq_ignore_ascii_case("true"));
-                        }
-                    }
-                    "FALLBACK_ENABLED" => {
-                        self.fallback_enabled = val == "1" || val.eq_ignore_ascii_case("true");
-                    }
-                    "TRACK_GENERATED_COMMITS" => {
-                        self.track_generated_commits =
-                            val == "1" || val.eq_ignore_ascii_case("true");
-                    }
-                    "DIFF_EXCLUDE_GLOBS" => {
-                        self.diff_exclude_globs = val
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                    }
-                    _ => {}
+                if *suffix == "AUTO_UPDATE" && from_local {
+                    continue;
                 }
+                self.set_field(suffix, val)
+                    .with_context(|| format!("Invalid value for {key}"))?;
             }
         }
+        Ok(())
     }
 
     /// Save to global TOML config file
     pub fn save_global(&self) -> Result<()> {
         let path = global_config_path().context("Could not determine global config directory")?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
-        let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        let mut validated = self.clone();
+        validated.validate()?;
+        let content = toml::to_string_pretty(&validated).context("Failed to serialize config")?;
+        crate::persistence::atomic_write(&path, content.as_bytes())?;
         Ok(())
     }
 
-    /// Save to local .env file in the git repo root
+    /// Save every supported project field as an explicit local override.
+    ///
+    /// Interactive editing uses [`save_local_overrides`] instead so inherited
+    /// values remain absent. This full form remains for callers that explicitly
+    /// want to materialize the current configuration.
     pub fn save_local(&self) -> Result<()> {
-        let root = crate::git::find_repo_root().context("Not in a git repository")?;
-        let env_path = PathBuf::from(&root).join(".env");
+        let explicit_fields = ENV_FIELD_MAP
+            .iter()
+            .filter(|(suffix, _)| *suffix != "AUTO_UPDATE")
+            .map(|(suffix, _)| (*suffix).to_string())
+            .collect();
+        self.save_local_overrides(&explicit_fields)
+    }
 
-        let mut lines = Vec::new();
-        lines.push(format!("ACR_PROVIDER={}", self.provider));
-        lines.push(format!("ACR_MODEL={}", self.model));
-        if !self.api_key.is_empty() {
-            lines.push(format!("ACR_API_KEY={}", self.api_key));
-        }
-        if !self.api_url.is_empty() {
-            lines.push(format!("ACR_API_URL={}", self.api_url));
-        }
-        if !self.api_headers.is_empty() {
-            lines.push(format!("ACR_API_HEADERS={}", self.api_headers));
-        }
-        lines.push(format!("ACR_LOCALE={}", self.locale));
-        lines.push(format!(
-            "ACR_ONE_LINER={}",
-            if self.one_liner { "1" } else { "0" }
-        ));
-        if self.commit_template != "$msg" {
-            lines.push(format!("ACR_COMMIT_TEMPLATE={}", self.commit_template));
-        }
-        if self.llm_system_prompt != DEFAULT_SYSTEM_PROMPT {
-            lines.push(format!("ACR_LLM_SYSTEM_PROMPT={}", self.llm_system_prompt));
-        }
-        lines.push(format!(
-            "ACR_USE_GITMOJI={}",
-            if self.use_gitmoji { "1" } else { "0" }
-        ));
-        lines.push(format!("ACR_GITMOJI_FORMAT={}", self.gitmoji_format));
-        lines.push(format!(
-            "ACR_REVIEW_COMMIT={}",
-            if self.review_commit { "1" } else { "0" }
-        ));
-        lines.push(format!(
-            "ACR_POST_COMMIT_PUSH={}",
-            normalize_post_commit_push(&self.post_commit_push)
-        ));
-        lines.push(format!(
-            "ACR_SUPPRESS_TOOL_OUTPUT={}",
-            if self.suppress_tool_output { "1" } else { "0" }
-        ));
-        lines.push(format!(
-            "ACR_WARN_STAGED_FILES_ENABLED={}",
-            if self.warn_staged_files_enabled {
-                "1"
-            } else {
-                "0"
-            }
-        ));
-        lines.push(format!(
-            "ACR_WARN_STAGED_FILES_THRESHOLD={}",
-            self.warn_staged_files_threshold
-        ));
-        lines.push(format!(
-            "ACR_CONFIRM_NEW_VERSION={}",
-            if self.confirm_new_version { "1" } else { "0" }
-        ));
-        // auto_update is global-only, not written to local .env
-        lines.push(format!(
-            "ACR_FALLBACK_ENABLED={}",
-            if self.fallback_enabled { "1" } else { "0" }
-        ));
-        lines.push(format!(
-            "ACR_TRACK_GENERATED_COMMITS={}",
-            if self.track_generated_commits {
-                "1"
-            } else {
-                "0"
-            }
-        ));
-        if !self.diff_exclude_globs.is_empty() {
-            lines.push(format!(
-                "ACR_DIFF_EXCLUDE_GLOBS={}",
-                self.diff_exclude_globs.join(",")
-            ));
-        }
-
-        std::fs::write(&env_path, lines.join("\n") + "\n")
-            .with_context(|| format!("Failed to write {}", env_path.display()))?;
-        Ok(())
+    /// Persist only explicit local overrides while leaving all unrelated `.env`
+    /// content byte-for-byte intact.
+    pub fn save_local_overrides(&self, explicit_fields: &HashSet<String>) -> Result<()> {
+        let mut validated = self.clone();
+        validated.validate()?;
+        let env_path = local_env_path().context("Not in a git repository")?;
+        crate::persistence::with_file_lock(&env_path, || {
+            let original = match std::fs::read_to_string(&env_path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to read {}", env_path.display()))
+                }
+            };
+            let rewritten = rewrite_dotenv(&original, &validated, explicit_fields)?;
+            crate::persistence::atomic_write_unlocked(&env_path, rewritten.as_bytes())
+        })
     }
 
     /// Get all fields as (display_name, env_suffix, current_value) tuples
@@ -567,6 +548,16 @@ impl AppConfig {
                     self.diff_exclude_globs.join(", ")
                 },
             ),
+            (
+                "Max Diff Bytes",
+                "MAX_DIFF_BYTES",
+                self.max_diff_bytes.to_string(),
+            ),
+            (
+                "Sensitive File Globs",
+                "SENSITIVE_FILE_GLOBS",
+                self.sensitive_file_globs.join(", "),
+            ),
         ]
     }
 
@@ -586,6 +577,8 @@ impl AppConfig {
             "COMMIT_TEMPLATE",
             "FALLBACK_ENABLED",
             "DIFF_EXCLUDE_GLOBS",
+            "MAX_DIFF_BYTES",
+            "SENSITIVE_FILE_GLOBS",
         ];
         let commit_keys: &[&'static str] = &[
             "ONE_LINER",
@@ -642,57 +635,119 @@ impl AppConfig {
     /// Set a field by its env suffix
     pub fn set_field(&mut self, suffix: &str, value: &str) -> Result<()> {
         match suffix {
-            "PROVIDER" => self.provider = value.into(),
+            "PROVIDER" => {
+                let provider = value.trim().to_ascii_lowercase();
+                if provider.is_empty() {
+                    anyhow::bail!("Provider cannot be empty");
+                }
+                self.provider = provider;
+            }
             "MODEL" => self.model = value.into(),
             "API_KEY" => self.api_key = value.into(),
             "API_URL" => self.api_url = value.into(),
-            "API_HEADERS" => self.api_headers = value.into(),
+            "API_HEADERS" => {
+                validate_api_headers(value)?;
+                self.api_headers = value.into();
+            }
             "LOCALE" => {
                 let locale = normalize_locale(value);
                 validate_locale(&locale)?;
                 self.locale = locale;
             }
-            "ONE_LINER" => self.one_liner = value == "1" || value.eq_ignore_ascii_case("true"),
-            "COMMIT_TEMPLATE" => self.commit_template = value.into(),
+            "ONE_LINER" => self.one_liner = parse_bool(value)?,
+            "COMMIT_TEMPLATE" => {
+                validate_commit_template(value)?;
+                self.commit_template = value.into();
+            }
             "LLM_SYSTEM_PROMPT" => self.llm_system_prompt = value.into(),
-            "USE_GITMOJI" => self.use_gitmoji = value == "1" || value.eq_ignore_ascii_case("true"),
-            "GITMOJI_FORMAT" => self.gitmoji_format = value.into(),
-            "REVIEW_COMMIT" => {
-                self.review_commit = value == "1" || value.eq_ignore_ascii_case("true")
+            "USE_GITMOJI" => self.use_gitmoji = parse_bool(value)?,
+            "GITMOJI_FORMAT" => {
+                self.gitmoji_format = validate_gitmoji_format(value)?;
             }
-            "POST_COMMIT_PUSH" => self.post_commit_push = normalize_post_commit_push(value),
-            "SUPPRESS_TOOL_OUTPUT" => {
-                self.suppress_tool_output = value == "1" || value.eq_ignore_ascii_case("true")
+            "REVIEW_COMMIT" => self.review_commit = parse_bool(value)?,
+            "POST_COMMIT_PUSH" => {
+                self.post_commit_push = validate_post_commit_push(value)?;
             }
+            "SUPPRESS_TOOL_OUTPUT" => self.suppress_tool_output = parse_bool(value)?,
             "WARN_STAGED_FILES_ENABLED" => {
-                self.warn_staged_files_enabled = value == "1" || value.eq_ignore_ascii_case("true");
+                self.warn_staged_files_enabled = parse_bool(value)?;
             }
             "WARN_STAGED_FILES_THRESHOLD" => {
-                self.warn_staged_files_threshold =
-                    parse_usize_or_default(value, default_warn_staged_files_threshold());
+                self.warn_staged_files_threshold = parse_usize(value)?;
             }
             "CONFIRM_NEW_VERSION" => {
-                self.confirm_new_version = value == "1" || value.eq_ignore_ascii_case("true");
+                self.confirm_new_version = parse_bool(value)?;
             }
             "AUTO_UPDATE" => {
-                self.auto_update = Some(value == "1" || value.eq_ignore_ascii_case("true"));
+                self.auto_update = Some(parse_bool(value)?);
             }
             "FALLBACK_ENABLED" => {
-                self.fallback_enabled = value == "1" || value.eq_ignore_ascii_case("true");
+                self.fallback_enabled = parse_bool(value)?;
             }
             "TRACK_GENERATED_COMMITS" => {
-                self.track_generated_commits = value == "1" || value.eq_ignore_ascii_case("true");
+                self.track_generated_commits = parse_bool(value)?;
             }
             "DIFF_EXCLUDE_GLOBS" => {
-                self.diff_exclude_globs = value
+                let globs: Vec<String> = value
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+                validate_globs(&globs)?;
+                self.diff_exclude_globs = globs;
             }
-            _ => {}
+            "MAX_DIFF_BYTES" => {
+                self.max_diff_bytes = parse_positive_usize(value, "Max diff bytes")?;
+            }
+            "SENSITIVE_FILE_GLOBS" => {
+                let globs: Vec<String> = value
+                    .split(',')
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect();
+                validate_globs(&globs)?;
+                self.sensitive_file_globs = globs;
+            }
+            _ => anyhow::bail!("Unknown setting '{suffix}'"),
         }
         Ok(())
+    }
+
+    /// Copy a single effective value from another configuration layer.
+    pub fn inherit_field(&mut self, suffix: &str, inherited: &Self) -> Result<()> {
+        let value = inherited.env_value(suffix)?;
+        self.set_field(suffix, &value)
+    }
+
+    pub fn env_value(&self, suffix: &str) -> Result<String> {
+        let bool_value = |value: bool| if value { "1" } else { "0" }.to_string();
+        let value = match suffix {
+            "PROVIDER" => self.provider.clone(),
+            "MODEL" => self.model.clone(),
+            "API_KEY" => self.api_key.clone(),
+            "API_URL" => self.api_url.clone(),
+            "API_HEADERS" => self.api_headers.clone(),
+            "LOCALE" => self.locale.clone(),
+            "ONE_LINER" => bool_value(self.one_liner),
+            "COMMIT_TEMPLATE" => self.commit_template.clone(),
+            "LLM_SYSTEM_PROMPT" => self.llm_system_prompt.clone(),
+            "USE_GITMOJI" => bool_value(self.use_gitmoji),
+            "GITMOJI_FORMAT" => self.gitmoji_format.clone(),
+            "REVIEW_COMMIT" => bool_value(self.review_commit),
+            "POST_COMMIT_PUSH" => self.post_commit_push.clone(),
+            "SUPPRESS_TOOL_OUTPUT" => bool_value(self.suppress_tool_output),
+            "WARN_STAGED_FILES_ENABLED" => bool_value(self.warn_staged_files_enabled),
+            "WARN_STAGED_FILES_THRESHOLD" => self.warn_staged_files_threshold.to_string(),
+            "CONFIRM_NEW_VERSION" => bool_value(self.confirm_new_version),
+            "AUTO_UPDATE" => self.auto_update.map(bool_value).unwrap_or_default(),
+            "FALLBACK_ENABLED" => bool_value(self.fallback_enabled),
+            "TRACK_GENERATED_COMMITS" => bool_value(self.track_generated_commits),
+            "DIFF_EXCLUDE_GLOBS" => self.diff_exclude_globs.join(","),
+            "MAX_DIFF_BYTES" => self.max_diff_bytes.to_string(),
+            "SENSITIVE_FILE_GLOBS" => self.sensitive_file_globs.join(","),
+            _ => anyhow::bail!("Unknown setting '{suffix}'"),
+        };
+        Ok(value)
     }
 
     /// Apply ephemeral `--set KEY=VALUE` overrides as the highest-priority layer.
@@ -720,9 +775,23 @@ impl AppConfig {
         Ok(())
     }
 
-    fn ensure_valid_locale(&mut self) -> Result<()> {
+    fn validate(&mut self) -> Result<()> {
+        self.provider = self.provider.trim().to_ascii_lowercase();
+        if self.provider.is_empty() {
+            anyhow::bail!("Provider cannot be empty");
+        }
         self.locale = normalize_locale(&self.locale);
-        validate_locale(&self.locale)
+        validate_locale(&self.locale)?;
+        self.post_commit_push = validate_post_commit_push(&self.post_commit_push)?;
+        self.gitmoji_format = validate_gitmoji_format(&self.gitmoji_format)?;
+        validate_commit_template(&self.commit_template)?;
+        validate_globs(&self.diff_exclude_globs)?;
+        validate_globs(&self.sensitive_file_globs)?;
+        if self.max_diff_bytes == 0 {
+            anyhow::bail!("Max diff bytes must be greater than zero");
+        }
+        validate_api_headers(&self.api_headers)?;
+        Ok(())
     }
 }
 
@@ -737,44 +806,50 @@ pub fn global_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("cgen").join("config.toml"))
 }
 
+fn local_env_path() -> Option<PathBuf> {
+    crate::git::find_repo_root()
+        .ok()
+        .map(|root| PathBuf::from(root).join(".env"))
+}
+
 /// Save only the auto_update preference to global config without overwriting other fields
 pub fn save_auto_update_preference(value: bool) -> Result<()> {
     let path = global_config_path().context("Could not determine global config directory")?;
+    crate::persistence::with_file_lock(&path, || {
+        let mut table: toml::Table = if path.exists() {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            content
+                .parse()
+                .with_context(|| format!("Failed to parse {}", path.display()))?
+        } else {
+            toml::Table::new()
+        };
 
-    let mut table: toml::Table = if path.exists() {
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        content.parse().unwrap_or_default()
-    } else {
-        toml::Table::new()
-    };
-
-    table.insert("auto_update".to_string(), toml::Value::Boolean(value));
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-
-    let content = toml::to_string_pretty(&table).context("Failed to serialize config")?;
-    std::fs::write(&path, content)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+        table.insert("auto_update".to_string(), toml::Value::Boolean(value));
+        let content = toml::to_string_pretty(&table).context("Failed to serialize config")?;
+        crate::persistence::atomic_write_unlocked(&path, content.as_bytes())
+    })
 }
 
 fn mask_key(key: &str) -> String {
-    if key.len() <= 8 {
-        "*".repeat(key.len())
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
+        "*".repeat(chars.len())
     } else {
-        format!("{}...{}", &key[..4], &key[key.len() - 4..])
+        format!(
+            "{}...{}",
+            chars[..4].iter().collect::<String>(),
+            chars[chars.len() - 4..].iter().collect::<String>()
+        )
     }
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        format!("{}...", s.chars().take(max).collect::<String>())
     }
 }
 
@@ -792,15 +867,95 @@ fn overridable_keys() -> Vec<String> {
 }
 
 fn normalize_post_commit_push(value: &str) -> String {
+    validate_post_commit_push(value).unwrap_or_else(|_| "ask".into())
+}
+
+fn validate_post_commit_push(value: &str) -> Result<String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "never" => "never".into(),
-        "always" => "always".into(),
-        _ => "ask".into(),
+        "never" => Ok("never".into()),
+        "always" => Ok("always".into()),
+        "ask" => Ok("ask".into()),
+        _ => anyhow::bail!("Expected one of: ask, always, never"),
     }
 }
 
-fn parse_usize_or_default(value: &str, default: usize) -> usize {
-    value.trim().parse::<usize>().unwrap_or(default)
+fn parse_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => anyhow::bail!("Expected one of: true, false, 1, 0"),
+    }
+}
+
+fn parse_usize(value: &str) -> Result<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("Expected a non-negative integer, got '{value}'"))
+}
+
+fn parse_positive_usize(value: &str, name: &str) -> Result<usize> {
+    let parsed = parse_usize(value)?;
+    if parsed == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn validate_gitmoji_format(value: &str) -> Result<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "unicode" => Ok("unicode".into()),
+        "shortcode" => Ok("shortcode".into()),
+        _ => anyhow::bail!("Expected one of: unicode, shortcode"),
+    }
+}
+
+fn validate_commit_template(value: &str) -> Result<()> {
+    if !value.contains("$msg") {
+        anyhow::bail!("Commit template must contain '$msg'");
+    }
+    Ok(())
+}
+
+fn validate_globs(globs: &[String]) -> Result<()> {
+    for pattern in globs {
+        glob::Pattern::new(pattern)
+            .with_context(|| format!("Invalid diff exclude glob '{pattern}'"))?;
+    }
+    Ok(())
+}
+
+fn validate_api_headers(raw: &str) -> Result<()> {
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    if raw.trim_start().starts_with('{') {
+        let headers: serde_json::Value =
+            serde_json::from_str(raw).context("API headers contain invalid JSON")?;
+        let object = headers
+            .as_object()
+            .context("API headers JSON must be an object")?;
+        if object
+            .iter()
+            .any(|(key, value)| key.trim().is_empty() || !value.is_string())
+        {
+            anyhow::bail!("API header names must be non-empty and values must be strings");
+        }
+        return Ok(());
+    }
+    for pair in raw.split(',') {
+        let (key, value) = pair
+            .split_once(':')
+            .context("API headers must be a JSON object or comma-separated 'Name: Value' pairs")?;
+        if key.trim().is_empty()
+            || value.trim().is_empty()
+            || key.chars().any(char::is_control)
+            || value.chars().any(char::is_control)
+        {
+            anyhow::bail!("API header names and values must be non-empty single-line text");
+        }
+    }
+    Ok(())
 }
 
 fn normalize_locale(value: &str) -> String {
@@ -808,64 +963,135 @@ fn normalize_locale(value: &str) -> String {
     if normalized.is_empty() {
         default_locale()
     } else {
-        normalized.to_ascii_lowercase()
+        normalized.replace('_', "-").to_ascii_lowercase()
     }
 }
 
 fn validate_locale(locale: &str) -> Result<()> {
-    if locale == "en" || locale_has_i18n(locale) {
-        return Ok(());
+    if locale.len() > 35 {
+        anyhow::bail!("Locale is too long");
     }
-    anyhow::bail!(
-        "Unsupported locale '{}'. Only 'en' is available unless matching i18n resources exist. Set locale with `cgen config` or add i18n files first.",
-        locale
-    );
+    let valid = locale.split('-').all(|part| {
+        !part.is_empty() && part.len() <= 8 && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    });
+    if !valid {
+        anyhow::bail!(
+            "Invalid locale '{locale}'. Use a language tag such as 'en', 'pt-BR', or 'zh-Hant'."
+        );
+    }
+    Ok(())
 }
 
-fn locale_has_i18n(locale: &str) -> bool {
-    locale_i18n_dirs()
-        .iter()
-        .any(|dir| locale_exists_in_i18n_dir(dir, locale))
-}
-
-fn locale_i18n_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(repo_root) = crate::git::find_repo_root() {
-        dirs.push(PathBuf::from(repo_root).join("i18n"));
-    }
-    if let Ok(current_dir) = std::env::current_dir() {
-        let i18n_dir = current_dir.join("i18n");
-        if !dirs.contains(&i18n_dir) {
-            dirs.push(i18n_dir);
+fn rewrite_dotenv(
+    original: &str,
+    config: &AppConfig,
+    explicit_fields: &HashSet<String>,
+) -> Result<String> {
+    for suffix in explicit_fields {
+        if suffix == "AUTO_UPDATE" || !ENV_FIELD_MAP.iter().any(|(known, _)| known == suffix) {
+            anyhow::bail!("Unknown or non-local setting '{suffix}'");
         }
     }
-    dirs
+
+    // Validate the existing file before editing so a malformed multiline value
+    // cannot be partially rewritten.
+    if !original.is_empty() {
+        parse_dotenv_reader(original.as_bytes())?;
+    }
+
+    let lines: Vec<&str> = original.split_inclusive('\n').collect();
+    let mut rewritten = String::with_capacity(original.len() + 256);
+    let mut written = HashSet::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some((key, value_start)) = dotenv_assignment(line) {
+            if let Some(suffix) = key.strip_prefix("ACR_") {
+                if ENV_FIELD_MAP.iter().any(|(known, _)| *known == suffix) {
+                    if explicit_fields.contains(suffix) && suffix != "AUTO_UPDATE" {
+                        let value = config.env_value(suffix)?;
+                        rewritten.push_str(&format!("ACR_{suffix}={}\n", quote_dotenv(&value)));
+                        written.insert(suffix.to_string());
+                    }
+                    index = consume_assignment(&lines, index, value_start);
+                    continue;
+                }
+            }
+        }
+        rewritten.push_str(line);
+        index += 1;
+    }
+
+    for (suffix, _) in ENV_FIELD_MAP {
+        if *suffix == "AUTO_UPDATE"
+            || !explicit_fields.contains(*suffix)
+            || written.contains(*suffix)
+        {
+            continue;
+        }
+        if !rewritten.is_empty() && !rewritten.ends_with('\n') {
+            rewritten.push('\n');
+        }
+        let value = config.env_value(suffix)?;
+        rewritten.push_str(&format!("ACR_{suffix}={}\n", quote_dotenv(&value)));
+    }
+    Ok(rewritten)
 }
 
-fn locale_exists_in_i18n_dir(i18n_dir: &PathBuf, locale: &str) -> bool {
-    if !i18n_dir.exists() {
-        return false;
+fn dotenv_assignment(line: &str) -> Option<(&str, &str)> {
+    let without_newline = line.trim_end_matches(['\r', '\n']);
+    let trimmed = without_newline.trim_start();
+    let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+    let (key, value) = trimmed.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty()
+        || !key.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        })
+    {
+        return None;
     }
-    if i18n_dir.join(locale).is_dir() {
-        return true;
-    }
+    Some((key, value.trim_start()))
+}
 
-    let entries = match std::fs::read_dir(i18n_dir) {
-        Ok(entries) => entries,
-        Err(_) => return false,
+fn consume_assignment(lines: &[&str], start: usize, value_start: &str) -> usize {
+    let Some(quote) = value_start
+        .bytes()
+        .next()
+        .filter(|byte| *byte == b'\'' || *byte == b'"')
+    else {
+        return start + 1;
     };
-
-    entries.filter_map(|entry| entry.ok()).any(|entry| {
-        let path = entry.path();
-        if path.is_file() {
-            return path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(|stem| stem.eq_ignore_ascii_case(locale))
-                .unwrap_or(false);
+    let mut escaped = false;
+    let mut opened = false;
+    for (offset, line) in lines[start..].iter().enumerate() {
+        let bytes = if offset == 0 {
+            value_start.as_bytes()
+        } else {
+            line.as_bytes()
+        };
+        for byte in bytes {
+            if !opened {
+                opened = true;
+                continue;
+            }
+            if quote == b'"' && !escaped && *byte == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if !escaped && *byte == quote {
+                return start + offset + 1;
+            }
+            escaped = false;
         }
-        false
-    })
+    }
+    lines.len()
+}
+
+fn quote_dotenv(value: &str) -> String {
+    let json = serde_json::to_string(value).expect("serializing a string cannot fail");
+    json.replace('$', "\\$")
 }
 
 /// Get description for a field by its env suffix
@@ -892,26 +1118,23 @@ pub fn field_description(suffix: &str) -> &'static str {
         "FALLBACK_ENABLED" => "Try fallback presets if primary LLM call fails",
         "TRACK_GENERATED_COMMITS" => "Track commits generated by cgen for history view",
         "DIFF_EXCLUDE_GLOBS" => "Comma-separated glob patterns for files to exclude from LLM diff analysis (e.g., *.json,*.lock)",
+        "MAX_DIFF_BYTES" => "Maximum filtered diff size sent to an LLM without --allow-large-diff",
+        "SENSITIVE_FILE_GLOBS" => "Comma-separated paths that require --allow-sensitive before LLM analysis",
         _ => "",
     }
 }
 
-fn parse_dotenv(path: &PathBuf) -> Result<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path)
+fn parse_dotenv(path: &Path) -> Result<HashMap<String, String>> {
+    let iter = dotenvy::from_path_iter(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut map = HashMap::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, val)) = line.split_once('=') {
-            let key = key.trim().to_string();
-            let val = val.trim().trim_matches('"').trim_matches('\'').to_string();
-            map.insert(key, val);
-        }
-    }
-    Ok(map)
+    iter.collect::<std::result::Result<HashMap<_, _>, _>>()
+        .with_context(|| format!("Failed to parse {}", path.display()))
+}
+
+fn parse_dotenv_reader(reader: impl std::io::Read) -> Result<HashMap<String, String>> {
+    dotenvy::from_read_iter(reader)
+        .collect::<std::result::Result<HashMap<_, _>, _>>()
+        .context("Failed to parse .env content")
 }
 
 #[cfg(test)]
@@ -957,20 +1180,56 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_usize_or_default() {
-        assert_eq!(parse_usize_or_default("10", 5), 10);
-        assert_eq!(parse_usize_or_default("  20  ", 5), 20);
-        assert_eq!(parse_usize_or_default("invalid", 5), 5);
-        assert_eq!(parse_usize_or_default("", 5), 5);
-        assert_eq!(parse_usize_or_default("-1", 5), 5); // negative not valid for usize
+    fn test_parse_usize() {
+        assert_eq!(parse_usize("10").unwrap(), 10);
+        assert_eq!(parse_usize("  20  ").unwrap(), 20);
+        assert!(parse_usize("invalid").is_err());
+        assert!(parse_usize("").is_err());
+        assert!(parse_usize("-1").is_err());
     }
 
     #[test]
     fn test_normalize_locale() {
         assert_eq!(normalize_locale("EN"), "en");
         assert_eq!(normalize_locale("  pt-BR  "), "pt-br");
+        assert_eq!(normalize_locale("pt_BR"), "pt-br");
         assert_eq!(normalize_locale(""), "en");
         assert_eq!(normalize_locale("   "), "en");
+    }
+
+    #[test]
+    fn test_unicode_display_helpers_are_char_safe() {
+        assert_eq!(mask_key("🔑abcdefgh"), "🔑abc...efgh");
+        assert_eq!(truncate("áéíóú", 3), "áéí...");
+    }
+
+    #[test]
+    fn test_rewrite_dotenv_preserves_unrelated_content() {
+        let original = "# app config\nAPP_URL='https://example.test/a b'\nACR_MODEL=old\n\n";
+        let config = AppConfig {
+            model: "model with spaces".into(),
+            ..Default::default()
+        };
+        let explicit = HashSet::from(["MODEL".to_string()]);
+        let rewritten = rewrite_dotenv(original, &config, &explicit).unwrap();
+        assert!(rewritten.starts_with(
+            "# app config\nAPP_URL='https://example.test/a b'\nACR_MODEL=\"model with spaces\"\n\n"
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_dotenv_removes_inherited_known_key_only() {
+        let original = "TOKEN=keep\nACR_API_KEY=remove\nACR_FUTURE=keep-too\n";
+        let rewritten = rewrite_dotenv(original, &AppConfig::default(), &HashSet::new()).unwrap();
+        assert_eq!(rewritten, "TOKEN=keep\nACR_FUTURE=keep-too\n");
+    }
+
+    #[test]
+    fn test_dotenv_quoted_value_round_trips() {
+        let value = "a value with \"quotes\", $cash, and\nnewlines";
+        let content = format!("ACR_API_KEY={}\n", quote_dotenv(value));
+        let parsed = parse_dotenv_reader(content.as_bytes()).unwrap();
+        assert_eq!(parsed.get("ACR_API_KEY").unwrap(), value);
     }
 
     #[test]
@@ -998,7 +1257,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "FOO=bar").unwrap();
         writeln!(file, "BAZ=qux").unwrap();
-        let map = parse_dotenv(&file.path().to_path_buf()).unwrap();
+        let map = parse_dotenv(file.path()).unwrap();
         assert_eq!(map.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(map.get("BAZ"), Some(&"qux".to_string()));
     }
@@ -1008,7 +1267,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "DOUBLE=\"value with spaces\"").unwrap();
         writeln!(file, "SINGLE='another value'").unwrap();
-        let map = parse_dotenv(&file.path().to_path_buf()).unwrap();
+        let map = parse_dotenv(file.path()).unwrap();
         assert_eq!(map.get("DOUBLE"), Some(&"value with spaces".to_string()));
         assert_eq!(map.get("SINGLE"), Some(&"another value".to_string()));
     }
@@ -1019,7 +1278,7 @@ mod tests {
         writeln!(file, "# This is a comment").unwrap();
         writeln!(file, "KEY=value").unwrap();
         writeln!(file, "# Another comment").unwrap();
-        let map = parse_dotenv(&file.path().to_path_buf()).unwrap();
+        let map = parse_dotenv(file.path()).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("KEY"), Some(&"value".to_string()));
     }
@@ -1027,10 +1286,10 @@ mod tests {
     #[test]
     fn test_parse_dotenv_skips_empty_lines() {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         writeln!(file, "KEY=value").unwrap();
         writeln!(file, "   ").unwrap();
-        let map = parse_dotenv(&file.path().to_path_buf()).unwrap();
+        let map = parse_dotenv(file.path()).unwrap();
         assert_eq!(map.len(), 1);
     }
 
@@ -1038,7 +1297,7 @@ mod tests {
     fn test_parse_dotenv_trims_whitespace() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "  KEY  =  value  ").unwrap();
-        let map = parse_dotenv(&file.path().to_path_buf()).unwrap();
+        let map = parse_dotenv(file.path()).unwrap();
         assert_eq!(map.get("KEY"), Some(&"value".to_string()));
     }
 
@@ -1127,10 +1386,10 @@ mod tests {
         cfg.set_field("WARN_STAGED_FILES_THRESHOLD", "50").unwrap();
         assert_eq!(cfg.warn_staged_files_threshold, 50);
 
-        // Invalid falls back to default
-        cfg.set_field("WARN_STAGED_FILES_THRESHOLD", "invalid")
-            .unwrap();
-        assert_eq!(cfg.warn_staged_files_threshold, 20);
+        assert!(cfg
+            .set_field("WARN_STAGED_FILES_THRESHOLD", "invalid")
+            .is_err());
+        assert_eq!(cfg.warn_staged_files_threshold, 50);
     }
 
     #[test]
@@ -1150,8 +1409,8 @@ mod tests {
         cfg.set_field("POST_COMMIT_PUSH", "NEVER").unwrap();
         assert_eq!(cfg.post_commit_push, "never");
 
-        cfg.set_field("POST_COMMIT_PUSH", "invalid").unwrap();
-        assert_eq!(cfg.post_commit_push, "ask");
+        assert!(cfg.set_field("POST_COMMIT_PUSH", "invalid").is_err());
+        assert_eq!(cfg.post_commit_push, "never");
     }
 
     #[test]
@@ -1167,37 +1426,36 @@ mod tests {
     }
 
     #[test]
-    fn test_app_config_merge_from() {
+    fn test_app_config_apply_partial() {
         let mut cfg = AppConfig::default();
-        let other = AppConfig {
-            provider: "openai".into(),
-            model: "gpt-4".into(),
-            one_liner: false,
+        let partial = PartialAppConfig {
+            provider: Some("openai".into()),
+            model: Some("gpt-4".into()),
+            one_liner: Some(false),
             ..Default::default()
         };
 
-        cfg.merge_from(&other);
+        cfg.apply_partial(partial);
         assert_eq!(cfg.provider, "openai");
         assert_eq!(cfg.model, "gpt-4");
         assert!(!cfg.one_liner);
     }
 
     #[test]
-    fn test_app_config_merge_from_empty_strings_not_merged() {
+    fn test_app_config_partial_omissions_are_not_merged() {
         let mut cfg = AppConfig {
-            provider: "groq".into(),
             api_key: "original-key".into(),
             ..Default::default()
         };
-        let other = AppConfig {
-            provider: "".into(), // Empty, should not override
-            api_key: "".into(),  // Empty, should not override
+        let partial = PartialAppConfig {
+            provider: Some("openai".into()),
             ..Default::default()
         };
 
-        cfg.merge_from(&other);
-        assert_eq!(cfg.provider, "groq"); // Not changed
-        assert_eq!(cfg.api_key, "original-key"); // Not changed
+        cfg.apply_partial(partial);
+        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.api_key, "original-key");
+        assert!(cfg.review_commit);
     }
 
     #[test]
@@ -1207,12 +1465,9 @@ mod tests {
 
     #[test]
     fn test_validate_locale_invalid() {
-        let result = validate_locale("xx-unknown");
+        let result = validate_locale("bad--tag");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unsupported locale"));
+        assert!(result.unwrap_err().to_string().contains("Invalid locale"));
     }
 
     #[test]
@@ -1235,7 +1490,7 @@ mod tests {
         map.insert("ACR_MODEL".into(), "gpt-4".into());
         map.insert("ACR_API_KEY".into(), "sk-test".into());
         map.insert("ACR_API_URL".into(), "https://custom.api".into());
-        map.insert("ACR_API_HEADERS".into(), "X-Custom: value".into());
+        map.insert("ACR_API_HEADERS".into(), r#"{"X-Custom":"value"}"#.into());
         map.insert("ACR_LOCALE".into(), "en".into());
         map.insert("ACR_ONE_LINER".into(), "false".into());
         map.insert("ACR_COMMIT_TEMPLATE".into(), "custom: $msg".into());
@@ -1253,13 +1508,13 @@ mod tests {
         map.insert("ACR_TRACK_GENERATED_COMMITS".into(), "false".into());
         map.insert("ACR_DIFF_EXCLUDE_GLOBS".into(), "*.md,*.txt".into());
 
-        cfg.apply_env_map(&map, false);
+        cfg.apply_env_map(&map, false).unwrap();
 
         assert_eq!(cfg.provider, "openai");
         assert_eq!(cfg.model, "gpt-4");
         assert_eq!(cfg.api_key, "sk-test");
         assert_eq!(cfg.api_url, "https://custom.api");
-        assert_eq!(cfg.api_headers, "X-Custom: value");
+        assert_eq!(cfg.api_headers, r#"{"X-Custom":"value"}"#);
         assert!(!cfg.one_liner);
         assert_eq!(cfg.commit_template, "custom: $msg");
         assert_eq!(cfg.llm_system_prompt, "custom prompt");
@@ -1284,11 +1539,11 @@ mod tests {
         map.insert("ACR_AUTO_UPDATE".into(), "true".into());
 
         // from_local = true should skip auto_update
-        cfg.apply_env_map(&map, true);
+        cfg.apply_env_map(&map, true).unwrap();
         assert!(cfg.auto_update.is_none());
 
         // from_local = false should apply auto_update
-        cfg.apply_env_map(&map, false);
+        cfg.apply_env_map(&map, false).unwrap();
         assert_eq!(cfg.auto_update, Some(true));
     }
 
@@ -1299,50 +1554,54 @@ mod tests {
 
         // Test "1" as true
         map.insert("ACR_USE_GITMOJI".into(), "1".into());
-        cfg.apply_env_map(&map, false);
+        cfg.apply_env_map(&map, false).unwrap();
         assert!(cfg.use_gitmoji);
 
         // Test "TRUE" (uppercase)
         map.clear();
         map.insert("ACR_REVIEW_COMMIT".into(), "TRUE".into());
         cfg.review_commit = false;
-        cfg.apply_env_map(&map, false);
+        cfg.apply_env_map(&map, false).unwrap();
         assert!(cfg.review_commit);
     }
 
     #[test]
-    fn test_merge_from_with_all_fields() {
+    fn test_apply_partial_with_all_fields() {
         let mut cfg = AppConfig::default();
-        let other = AppConfig {
-            provider: "anthropic".into(),
-            model: "claude-3".into(),
-            api_key: "sk-ant".into(),
-            api_url: "https://api.anthropic.com".into(),
-            api_headers: "x-api-key: test".into(),
-            locale: "es".into(),
-            one_liner: false,
-            commit_template: "feat: $msg".into(),
-            llm_system_prompt: "custom".into(),
-            use_gitmoji: true,
-            gitmoji_format: "shortcode".into(),
-            review_commit: false,
-            post_commit_push: "never".into(),
-            suppress_tool_output: true,
-            warn_staged_files_enabled: false,
-            warn_staged_files_threshold: 100,
-            confirm_new_version: false,
+        let partial = PartialAppConfig {
+            provider: Some("anthropic".into()),
+            model: Some("claude-3".into()),
+            api_key: Some("sk-ant".into()),
+            api_url: Some("https://api.anthropic.com".into()),
+            api_headers: Some(r#"{"x-api-key":"test"}"#.into()),
+            locale: Some("es".into()),
+            one_liner: Some(false),
+            commit_template: Some("feat: $msg".into()),
+            llm_system_prompt: Some("custom".into()),
+            use_gitmoji: Some(true),
+            gitmoji_format: Some("shortcode".into()),
+            review_commit: Some(false),
+            post_commit_push: Some("never".into()),
+            suppress_tool_output: Some(true),
+            warn_staged_files_enabled: Some(false),
+            warn_staged_files_threshold: Some(100),
+            confirm_new_version: Some(false),
             auto_update: Some(true),
-            fallback_enabled: false,
-            track_generated_commits: false,
-            diff_exclude_globs: vec!["*.log".into()],
+            fallback_enabled: Some(false),
+            track_generated_commits: Some(false),
+            diff_exclude_globs: Some(vec!["*.log".into()]),
+            max_diff_bytes: Some(123_456),
+            sensitive_file_globs: Some(vec!["*.secret".into()]),
         };
 
-        cfg.merge_from(&other);
+        cfg.apply_partial(partial);
 
         assert_eq!(cfg.provider, "anthropic");
         assert_eq!(cfg.api_url, "https://api.anthropic.com");
-        assert_eq!(cfg.api_headers, "x-api-key: test");
+        assert_eq!(cfg.api_headers, r#"{"x-api-key":"test"}"#);
         assert_eq!(cfg.auto_update, Some(true));
+        assert_eq!(cfg.max_diff_bytes, 123_456);
+        assert_eq!(cfg.sensitive_file_globs, vec!["*.secret"]);
     }
 
     #[test]
@@ -1431,10 +1690,10 @@ mod tests {
     }
 
     #[test]
-    fn test_set_field_unknown_does_nothing() {
+    fn test_set_field_unknown_is_rejected() {
         let mut cfg = AppConfig::default();
         let original_provider = cfg.provider.clone();
-        cfg.set_field("UNKNOWN_FIELD", "value").unwrap();
+        assert!(cfg.set_field("UNKNOWN_FIELD", "value").is_err());
         assert_eq!(cfg.provider, original_provider);
     }
 
@@ -1496,8 +1755,8 @@ mod tests {
     fn test_apply_overrides_propagates_locale_error() {
         let mut cfg = AppConfig::default();
         let err = cfg
-            .apply_overrides(&["locale=zz-invalid".to_string()])
+            .apply_overrides(&["locale=bad--tag".to_string()])
             .unwrap_err();
-        assert!(format!("{err:#}").contains("Unsupported locale"));
+        assert!(format!("{err:#}").contains("Invalid locale"));
     }
 }
