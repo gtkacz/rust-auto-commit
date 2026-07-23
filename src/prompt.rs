@@ -224,6 +224,22 @@ pub fn validate_commit_message(message: &str, cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Validate the final text handed to Git after templating or manual editing.
+///
+/// Templates and human edits are deliberate, so only structural problems that
+/// would corrupt the Git invocation are rejected; Conventional Commit shape is
+/// enforced on the LLM output alone by [`validate_commit_message`].
+pub fn validate_final_message(message: &str) -> Result<()> {
+    let message = message.trim();
+    if message.is_empty() {
+        anyhow::bail!("Commit message is empty");
+    }
+    if message.contains('\0') {
+        anyhow::bail!("Commit message contains a NUL byte");
+    }
+    Ok(())
+}
+
 fn strip_required_gitmoji<'a>(line: &'a str, format: &str) -> Result<&'a str> {
     let (prefix, message) = line
         .split_once(' ')

@@ -316,7 +316,7 @@ fn generate_final_message(
                 .replace("$msg", message.trim())
                 .trim()
                 .to_string();
-            prompt::validate_commit_message(&candidate, cfg)
+            prompt::validate_final_message(&candidate)
                 .context("Commit template produced an invalid commit message")?;
 
             if time_to_ready.is_none() {
@@ -342,7 +342,7 @@ fn generate_final_message(
                 ReviewAction::Edit => {
                     let edited = editor::edit(&candidate)?;
                     let edited = edited.trim().to_string();
-                    match prompt::validate_commit_message(&edited, cfg) {
+                    match prompt::validate_final_message(&edited) {
                         Ok(()) => break edited,
                         Err(error) => {
                             println!("  {} {}", "invalid message:".red().bold(), error);
@@ -362,7 +362,7 @@ fn generate_final_message(
             .replace("$msg", message.trim())
             .trim()
             .to_string();
-        prompt::validate_commit_message(&final_msg, cfg)
+        prompt::validate_final_message(&final_msg)
             .context("Commit template produced an invalid commit message")?;
         time_to_ready = Some(gen_start.elapsed());
         println!("\n{} {}", "Commit message:".green().bold(), final_msg);

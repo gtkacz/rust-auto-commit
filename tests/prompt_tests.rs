@@ -1,7 +1,7 @@
 use auto_commit_rs::config::AppConfig;
 use auto_commit_rs::prompt::{
     build_correction_prompt, build_system_prompt, build_user_prompt, clean_commit_message,
-    validate_commit_message,
+    validate_commit_message, validate_final_message,
 };
 
 #[test]
@@ -239,4 +239,18 @@ fn validates_configured_gitmoji_format() {
     cfg.gitmoji_format = "shortcode".into();
     validate_commit_message(":sparkles: feat: add presets", &cfg).unwrap();
     assert!(validate_commit_message("✨ feat: add presets", &cfg).is_err());
+}
+
+#[test]
+fn final_message_allows_non_conventional_templates_and_edits() {
+    validate_final_message("[JIRA-123] feat: add login").unwrap();
+    validate_final_message("Merge cleanup before release").unwrap();
+    validate_final_message("feat: first line\n\nedited body").unwrap();
+}
+
+#[test]
+fn final_message_rejects_structurally_broken_text() {
+    assert!(validate_final_message("").is_err());
+    assert!(validate_final_message("   ").is_err());
+    assert!(validate_final_message("feat: ok\0nul").is_err());
 }
