@@ -37,14 +37,17 @@ fn run() -> Result<()> {
         }
     }
 
-    // Check for updates (except for config/update/history commands)
+    // Check for updates, except for commands that are local-only or manage
+    // updates/config themselves
     let update_warning = match &cli.command {
         Some(
             cli::Command::Config
             | cli::Command::Update
             | cli::Command::History
             | cli::Command::Preset
-            | cli::Command::Fallback,
+            | cli::Command::Fallback
+            | cli::Command::Prompt
+            | cli::Command::Undo,
         ) => None,
         _ => check_for_updates(cfg.as_ref()),
     };
