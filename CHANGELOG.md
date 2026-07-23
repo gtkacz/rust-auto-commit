@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configurable diff byte/sensitive-path guards and explicit `--allow-large-diff` / `--allow-sensitive` overrides
 - Linux ARM64 and x86_64 musl release artifacts with SHA-256 manifests
 - Rust 1.74 MSRV declaration and CI gate
+- One-shot self-correction: when the LLM returns an invalid commit message, the validator error and rejected attempt are fed back to the model for a corrective retry before failing
 
 ### Changed
 
@@ -27,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release CI builds with `--locked`, validates the requested tag, publishes checksums, and gates crates.io publication behind the release
 - CI now enforces formatting, strict Clippy, cross-platform tests, MSRV, dependency audit, installer syntax, and aligned coverage
 - Locked dependencies use patched TLS, error-handling, randomness, and test-serialization releases; terminal UI features avoid unnecessary unmaintained/yanked transitive paths while preserving Rust 1.74 support
+- Rewrote the base LLM prompts around current prompt-engineering research: enumerated commit types, imperative-mood and header-length rules, anti-fabrication constraints, mode-matched few-shot examples, and explicit one-liner precedence
+- Staged diffs are sent wrapped in `<diff>` tags as data to describe, with the task restated after the diff
+- A blank `ACR_LLM_SYSTEM_PROMPT` now selects the built-in default prompt, and configs still storing a retired shipped default are upgraded to the current default automatically
+- The config view shows `(built-in default)` for an uncustomized system prompt instead of the stored text
+- Anthropic requests pin `temperature` to 0, matching the other providers
 
 ### Fixed
 
@@ -43,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Selected-repository history uses that repository for `git show`
 - Concurrent preset/cache writes no longer silently overwrite one another
 - The updater uses the published `auto-commit-rs` crate rather than a nonexistent package
+- Non-English locales no longer instruct the LLM to translate Conventional Commit types, which produced headers that failed message validation
 
 ### Removed
 
