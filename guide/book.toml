@@ -1,0 +1,14 @@
+[book]
+title = "cgen"
+authors = ["Gabriel Tkacz"]
+description = "Fast, lightweight CLI tool that generates git commit messages using LLMs."
+src = "src"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/gtkacz/smart-commit-rs"
+edit-url-template = "https://github.com/gtkacz/smart-commit-rs/edit/main/guide/{path}"
+site-url = "/smart-commit-rs/"
+
+[output.linkcheck]
+follow-web-links = false

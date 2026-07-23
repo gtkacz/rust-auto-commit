@@ -26,6 +26,10 @@ target
 !CONTRIBUTING.md
 !CHANGELOG.md
 !data/conventions/*.md
+# mdBook source (override the blanket *.md ignore)
+!guide/**/*.md
+# mdBook build output
+guide/book/
 .serena/
 .chunkhound
 .chunkhound.json
