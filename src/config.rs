@@ -1097,7 +1097,7 @@ fn quote_dotenv(value: &str) -> String {
 /// Get description for a field by its env suffix
 pub fn field_description(suffix: &str) -> &'static str {
     match suffix {
-        "PROVIDER" => "LLM provider (gemini, openai, anthropic, groq, grok, deepseek, openrouter, mistral, together, fireworks, perplexity, or custom)",
+        "PROVIDER" => "LLM provider (gemini, openai, anthropic, groq, grok, deepseek, openrouter, mistral, together, fireworks, perplexity, lm_studio, ollama, or custom)",
         "MODEL" => "Model identifier for the selected provider",
         "API_KEY" => "API key for authenticating with the LLM provider",
         "API_URL" => "Custom API endpoint URL (leave empty to use provider default)",
@@ -1303,7 +1303,8 @@ mod tests {
 
     #[test]
     fn test_field_description_known() {
-        assert!(!field_description("PROVIDER").is_empty());
+        assert!(field_description("PROVIDER").contains("lm_studio"));
+        assert!(field_description("PROVIDER").contains("ollama"));
         assert!(!field_description("MODEL").is_empty());
         assert!(!field_description("API_KEY").is_empty());
         assert!(!field_description("DIFF_EXCLUDE_GLOBS").is_empty());
