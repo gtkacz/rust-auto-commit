@@ -147,6 +147,7 @@ comments; choosing “Inherit global value” removes that local assignment.
 | `ACR_TRACK_GENERATED_COMMITS` | `1` | Track AI-generated commits per repository (`1`/`0`) |
 | `ACR_DIFF_EXCLUDE_GLOBS` | (see below) | Comma-separated glob patterns for files to exclude from LLM analysis |
 | `ACR_MAX_DIFF_BYTES` | `200000` | Maximum filtered diff bytes accepted without `--allow-large-diff` |
+| `ACR_MAX_OUTPUT_TOKENS` | `512` | Maximum tokens the LLM may generate for one commit message |
 | `ACR_SENSITIVE_FILE_GLOBS` | `.env,.env.*,...` | Paths that require `--allow-sensitive` before LLM analysis |
 
 ### Per-Invocation Overrides

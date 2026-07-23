@@ -199,7 +199,13 @@ fn call_llm_inner(
     let url = interpolate(&url, cfg).map_err(LlmCallError::Other)?;
     let headers_raw = interpolate(&headers_raw, cfg).map_err(LlmCallError::Other)?;
 
-    let body = build_request_body(format, &cfg.model, system_prompt, user_prompt);
+    let body = build_request_body(
+        format,
+        &cfg.model,
+        system_prompt,
+        user_prompt,
+        cfg.max_output_tokens,
+    );
     let headers = parse_headers(&headers_raw).map_err(LlmCallError::Other)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -407,6 +413,7 @@ fn build_request_body(
     model: &str,
     system_prompt: &str,
     user_prompt: &str,
+    max_output_tokens: usize,
 ) -> Value {
     match format {
         RequestFormat::Gemini => {
@@ -419,7 +426,8 @@ fn build_request_body(
                     "parts": [{ "text": user_prompt }]
                 }],
                 "generationConfig": {
-                    "temperature": 0
+                    "temperature": 0,
+                    "maxOutputTokens": max_output_tokens
                 }
             })
         }
@@ -430,7 +438,7 @@ fn build_request_body(
                     { "role": "system", "content": system_prompt },
                     { "role": "user", "content": user_prompt }
                 ],
-                "max_tokens": 512,
+                "max_tokens": max_output_tokens,
                 "temperature": 0,
                 "stream": false
             })
@@ -442,7 +450,7 @@ fn build_request_body(
                 "messages": [
                     { "role": "user", "content": user_prompt }
                 ],
-                "max_tokens": 512,
+                "max_tokens": max_output_tokens,
                 "temperature": 0,
                 "stream": false
             })
@@ -710,13 +718,14 @@ mod tests {
             "gpt-4o",
             "system prompt",
             "user diff",
+            640,
         );
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "system prompt");
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "user diff");
-        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["max_tokens"], 640);
         assert_eq!(body["temperature"], 0);
     }
 
@@ -727,6 +736,7 @@ mod tests {
             "gemini-pro",
             "system prompt",
             "user diff",
+            512,
         );
         assert_eq!(
             body["system_instruction"]["parts"][0]["text"],
@@ -735,6 +745,7 @@ mod tests {
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["contents"][0]["parts"][0]["text"], "user diff");
         assert_eq!(body["generationConfig"]["temperature"], 0);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 512);
     }
 
     #[test]
@@ -744,12 +755,13 @@ mod tests {
             "claude-3-opus",
             "system prompt",
             "user diff",
+            640,
         );
         assert_eq!(body["model"], "claude-3-opus");
         assert_eq!(body["system"], "system prompt");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "user diff");
-        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["max_tokens"], 640);
         assert_eq!(body["temperature"], 0);
     }
 
@@ -760,11 +772,13 @@ mod tests {
             "qwen/qwen3.5-35b-a3b",
             "system prompt",
             "user diff",
+            512,
         );
         assert_eq!(body["model"], "qwen/qwen3.5-35b-a3b");
         assert_eq!(body["system_prompt"], "system prompt");
         assert_eq!(body["input"], "user diff");
         assert!(body.get("messages").is_none());
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]

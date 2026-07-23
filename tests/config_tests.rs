@@ -9,7 +9,7 @@ use serial_test::serial;
 
 use crate::common::{DirGuard, EnvGuard, GlobalConfigGuard};
 
-fn acr_env_keys() -> [&'static str; 26] {
+fn acr_env_keys() -> [&'static str; 27] {
     [
         "ACR_CONFIG_HOME",
         "ACR_PROVIDER",
@@ -36,6 +36,7 @@ fn acr_env_keys() -> [&'static str; 26] {
         "ACR_TRACK_GENERATED_COMMITS",
         "ACR_DIFF_EXCLUDE_GLOBS",
         "ACR_MAX_DIFF_BYTES",
+        "ACR_MAX_OUTPUT_TOKENS",
         "ACR_SENSITIVE_FILE_GLOBS",
     ]
 }
@@ -765,4 +766,18 @@ fn warn_llm_files_env_and_local_save_roundtrip() {
         .unwrap();
     let saved = fs::read_to_string(repo.path().join(".env")).unwrap();
     assert!(saved.contains("ACR_WARN_LLM_FILES_THRESHOLD=\"11\""));
+}
+
+#[test]
+fn max_output_tokens_defaults_and_validation() {
+    let cfg = AppConfig::default();
+    assert_eq!(cfg.max_output_tokens, 512);
+
+    let mut cfg = AppConfig::default();
+    cfg.set_field("MAX_OUTPUT_TOKENS", "1024").unwrap();
+    assert_eq!(cfg.max_output_tokens, 1024);
+    assert!(cfg.set_field("MAX_OUTPUT_TOKENS", "0").is_err());
+    assert!(cfg.set_field("MAX_OUTPUT_TOKENS", "nope").is_err());
+    assert_eq!(cfg.env_value("MAX_OUTPUT_TOKENS").unwrap(), "1024");
+    assert!(!field_description("MAX_OUTPUT_TOKENS").is_empty());
 }
