@@ -101,22 +101,7 @@ fn run_standard_commit(cfg: &config::AppConfig, cli: &cli::Cli) -> Result<()> {
     ensure_api_key(cfg)?;
 
     let staged_files = git::list_staged_files().context("Failed to list staged files")?;
-    print_staged_files(&staged_files);
 
-    if cfg.warn_staged_files_enabled && staged_files.len() > cfg.warn_staged_files_threshold {
-        let prompt = format!(
-            "You have {} staged files (threshold {}). Continue with commit generation?",
-            staged_files.len(),
-            cfg.warn_staged_files_threshold
-        );
-        let should_continue = ui::confirm(&prompt, false);
-        if !should_continue {
-            println!("{}", "Commit cancelled.".dimmed());
-            return Ok(());
-        }
-    }
-
-    let gen_start = Instant::now();
     let excludes: Vec<String> = cfg
         .diff_exclude_globs
         .iter()
@@ -125,13 +110,23 @@ fn run_standard_commit(cfg: &config::AppConfig, cli: &cli::Cli) -> Result<()> {
         .collect();
     let diff = git::get_staged_diff_filtered(&cli.diff_include, &excludes)
         .context("Failed to get staged diff")?;
-    workflow::enforce_diff_safety(
+    let report = workflow::enforce_diff_safety(
         cfg,
         &diff,
         &staged_files,
         cli.allow_large_diff,
         cli.allow_sensitive,
     )?;
+    print_staged_files(&staged_files, &report.included_files);
+
+    if let Some(prompt) = workflow::staged_files_warning(cfg, staged_files.len(), &report) {
+        if !ui::confirm(&prompt, false) {
+            println!("{}", "Commit cancelled.".dimmed());
+            return Ok(());
+        }
+    }
+
+    let gen_start = Instant::now();
     let Some((final_msg, time_to_ready)) =
         generate_final_message(cfg, &diff, cli.verbose, gen_start)?
     else {
@@ -419,7 +414,7 @@ fn review_message() -> Result<ReviewAction> {
     }
 }
 
-fn print_staged_files(staged_files: &[String]) {
+fn print_staged_files(staged_files: &[String], llm_files: &[String]) {
     println!(
         "\n{} {}",
         "Staged files:".green().bold(),
@@ -430,6 +425,7 @@ fn print_staged_files(staged_files: &[String]) {
         return;
     }
 
+    let llm: std::collections::HashSet<&str> = llm_files.iter().map(String::as_str).collect();
     let last = staged_files.len() - 1;
     for (i, file) in staged_files.iter().enumerate() {
         let connector = if i == last {
@@ -437,7 +433,11 @@ fn print_staged_files(staged_files: &[String]) {
         } else {
             "\u{251C}\u{2500}\u{2500}"
         };
-        println!("  {} {}", connector, file);
+        if llm.contains(file.as_str()) {
+            println!("  {} {}", connector, file);
+        } else {
+            println!("  {} {} {}", connector, file, "(not sent to LLM)".dimmed());
+        }
     }
 }
 

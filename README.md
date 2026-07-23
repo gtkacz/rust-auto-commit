@@ -214,8 +214,8 @@ a JSON object with string values.
 
 ### Safety and Workflow Controls
 
-- `cgen` now prints staged file count and names before generating a commit message.
-- If staged files exceed `ACR_WARN_STAGED_FILES_THRESHOLD` and warnings are enabled, cgen asks for confirmation before continuing.
+- `cgen` prints staged file count and names before generating a commit message; files excluded from the LLM payload are marked `(not sent to LLM)`.
+- If staged files exceed `ACR_WARN_STAGED_FILES_THRESHOLD`, or the files actually sent to the LLM exceed `ACR_WARN_LLM_FILES_THRESHOLD`, cgen asks one merged confirmation (including the payload size in KB) before continuing. Each check can be disabled with its `_ENABLED` flag.
 - `cgen --dry-run` generates and prints the final commit message but does not create a commit.
 - `cgen --verbose` prints the final system prompt sent to the LLM and never prints diff payload.
 - Sensitive filenames and high-confidence credential patterns are blocked before any provider request; use `--allow-sensitive` only after reviewing the exact staged diff.
