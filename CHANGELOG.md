@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] - 2026-07-23
 
 ### Added
 
@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux ARM64 and x86_64 musl release artifacts with SHA-256 manifests
 - Rust 1.74 MSRV declaration and CI gate
 - One-shot self-correction: when the LLM returns an invalid commit message, the validator error and rejected attempt are fed back to the model for a corrective retry before failing
+- `ACR_WARN_LLM_FILES_ENABLED` / `ACR_WARN_LLM_FILES_THRESHOLD`: warn on the count of files actually sent to the LLM (the token-relevant subset), merged with the staged-files warning into a single confirmation that reports the payload size
+- Staged-file listing marks files excluded from the LLM payload with `(not sent to LLM)`
+- `ACR_MAX_OUTPUT_TOKENS` to configure the LLM completion token cap (default 512, previously hard-coded)
 
 ### Changed
 
@@ -31,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A blank `ACR_LLM_SYSTEM_PROMPT` now selects the built-in default prompt, and configs still storing a retired shipped default are upgraded to the current default automatically
 - The config view shows `(built-in default)` for an uncustomized system prompt instead of the stored text
 - Anthropic requests pin `temperature` to 0, matching the other providers
+- Conventional Commit shape is enforced on LLM output only; templated and manually edited messages receive structural validation (empty/NUL)
+- Staged-file warnings are evaluated after diff filtering, so hard safety gates run before any confirmation prompt
+- `cgen prompt` and `cgen undo` no longer perform the startup update check
 
 ### Fixed
 
@@ -48,10 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Concurrent preset/cache writes no longer silently overwrite one another
 - The updater uses the published `auto-commit-rs` crate rather than a nonexistent package
 - Non-English locales no longer instruct the LLM to translate Conventional Commit types, which produced headers that failed message validation
+- Fallback presets that differ from the active configuration only by API headers are attempted instead of silently skipped
 
 ### Removed
 
 - High-MSRV `edit` dependency; editor launching is handled internally
+- Unused `enabled` flag inside the presets file's `[fallback]` section (existing files containing it still parse)
 
 ## [1.3.2] - 2026-06-25
 
