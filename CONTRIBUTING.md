@@ -31,7 +31,7 @@ First off, thank you for considering contributing to cgen! Every contribution he
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (stable toolchain, 1.74+)
+- [Rust](https://rustup.rs/) (stable toolchain, 1.85+)
 - Git
 
 ### Build & Run

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -20,16 +21,18 @@ pub struct VersionCheck {
 /// Fetch the latest release tag from GitHub API with a short timeout.
 pub fn fetch_latest_version() -> Result<String> {
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .into();
     let response: serde_json::Value = agent
         .get(&url)
-        .set("User-Agent", "cgen")
-        .set("Accept", "application/vnd.github.v3+json")
+        .header("User-Agent", "cgen")
+        .header("Accept", "application/vnd.github.v3+json")
         .call()
         .context("Failed to reach GitHub API")?
-        .into_json()
+        .body_mut()
+        .read_json()
         .context("Failed to parse GitHub API response")?;
 
     response["tag_name"]
@@ -148,15 +151,18 @@ fn update_release_binary(version: &str, executable: &Path) -> Result<()> {
 }
 
 fn download(url: &str, limit: usize) -> Result<Vec<u8>> {
-    let response = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(60))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(60)))
         .build()
+        .into();
+    let response = agent
         .get(url)
-        .set("User-Agent", "cgen")
+        .header("User-Agent", "cgen")
         .call()
         .with_context(|| format!("GET {url} failed"))?;
     let mut bytes = Vec::new();
     response
+        .into_body()
         .into_reader()
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
@@ -170,13 +176,22 @@ fn download(url: &str, limit: usize) -> Result<Vec<u8>> {
 fn verify_checksum(artifact: &str, binary: &[u8], checksums: &str) -> Result<()> {
     let expected = checksum_for(artifact, checksums)
         .with_context(|| format!("No checksum published for {artifact}"))?;
-    let actual = format!("{:x}", Sha256::digest(binary));
+    let actual = sha256_hex(binary);
     if !actual.eq_ignore_ascii_case(expected) {
         anyhow::bail!(
             "Checksum mismatch for {artifact}; expected {expected}, received {actual}. Existing binary was not changed."
         );
     }
     Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 fn checksum_for<'a>(artifact: &str, checksums: &'a str) -> Option<&'a str> {
@@ -294,7 +309,7 @@ mod tests {
     #[test]
     fn checksum_lookup_and_verification_are_exact() {
         let binary = b"verified binary";
-        let digest = format!("{:x}", Sha256::digest(binary));
+        let digest = sha256_hex(binary);
         let checksums = format!("{digest}  cgen-linux-amd64\n");
         verify_checksum("cgen-linux-amd64", binary, &checksums).unwrap();
         assert!(verify_checksum("other", binary, &checksums).is_err());

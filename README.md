@@ -326,7 +326,7 @@ cargo llvm-cov --locked --lib --tests \
   --fail-under-lines 90
 ```
 
-CI additionally requires Rustfmt, strict all-target Clippy, Rust 1.74, dependency
+CI additionally requires Rustfmt, strict all-target Clippy, Rust 1.85, dependency
 audit, and tests on Linux, macOS, and Windows.
 
 ## Contributing

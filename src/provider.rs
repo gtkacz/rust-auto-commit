@@ -206,6 +206,9 @@ fn call_llm_inner(
         user_prompt,
         cfg.max_output_tokens,
     );
+    let body = serde_json::to_vec(&body).map_err(|error| {
+        LlmCallError::Other(anyhow::anyhow!("Failed to serialize API request: {error}"))
+    })?;
     let headers = parse_headers(&headers_raw).map_err(LlmCallError::Other)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -224,35 +227,46 @@ fn call_llm_inner(
     spinner.enable_steady_tick(Duration::from_millis(80));
 
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    let agent = AGENT.get_or_init(|| ureq::AgentBuilder::new().build());
-    let mut req = agent.post(&url).timeout(remaining);
+    let agent = AGENT.get_or_init(ureq::Agent::new_with_defaults);
+    let mut req = agent.post(&url);
     for (key, val) in &headers {
-        req = req.set(key, val);
+        req = req.header(key, val);
     }
-    req = req.set("Content-Type", "application/json");
+    if !headers
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+    {
+        req = req.header("Content-Type", "application/json");
+    }
 
-    let response = req.send_json(&body);
+    let response = req
+        .config()
+        .timeout_global(Some(remaining))
+        .http_status_as_error(false)
+        .build()
+        .send(body.as_slice());
 
     spinner.finish_and_clear();
 
     let response = match response {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = read_bounded(resp.into_reader(), MAX_ERROR_BODY_BYTES)
-                .unwrap_or_else(|_| "<response body unavailable>".into());
-            let body = redact(&body, &cfg.api_key);
-            return Err(LlmCallError::HttpError { code, body });
-        }
-        Err(ureq::Error::Transport(t)) => {
+        Err(error) => {
             return Err(LlmCallError::TransportError(redact(
-                &t.to_string(),
+                &error.to_string(),
                 &cfg.api_key,
             )));
         }
     };
+    let status = response.status().as_u16();
+    if status >= 400 {
+        let body = read_bounded(response.into_body().into_reader(), MAX_ERROR_BODY_BYTES)
+            .unwrap_or_else(|_| "<response body unavailable>".into());
+        let body = redact(&body, &cfg.api_key);
+        return Err(LlmCallError::HttpError { code: status, body });
+    }
 
-    let response_body =
-        read_bounded(response.into_reader(), MAX_RESPONSE_BYTES).map_err(LlmCallError::Other)?;
+    let response_body = read_bounded(response.into_body().into_reader(), MAX_RESPONSE_BYTES)
+        .map_err(LlmCallError::Other)?;
     let json: Value = serde_json::from_str(&response_body).map_err(|e| {
         LlmCallError::Other(anyhow::anyhow!("Failed to parse API response as JSON: {e}"))
     })?;

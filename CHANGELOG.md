@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Updated all Rust dependencies, including the `ureq` 3, `toml` 1.1, `sha2` 0.11, `inquire` 0.9, `colored` 3, and `shlex` 2 major releases
+- Raised the MSRV to Rust 1.85, the minimum required by the updated dependency graph
+- Updated GitHub Actions to their current supported major releases
+
 ## [1.4.0] - 2026-07-23
 
 ### Added
