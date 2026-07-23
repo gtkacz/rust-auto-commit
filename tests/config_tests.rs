@@ -9,7 +9,7 @@ use serial_test::serial;
 
 use crate::common::{DirGuard, EnvGuard, GlobalConfigGuard};
 
-fn acr_env_keys() -> [&'static str; 24] {
+fn acr_env_keys() -> [&'static str; 26] {
     [
         "ACR_CONFIG_HOME",
         "ACR_PROVIDER",
@@ -28,6 +28,8 @@ fn acr_env_keys() -> [&'static str; 24] {
         "ACR_SUPPRESS_TOOL_OUTPUT",
         "ACR_WARN_STAGED_FILES_ENABLED",
         "ACR_WARN_STAGED_FILES_THRESHOLD",
+        "ACR_WARN_LLM_FILES_ENABLED",
+        "ACR_WARN_LLM_FILES_THRESHOLD",
         "ACR_CONFIRM_NEW_VERSION",
         "ACR_AUTO_UPDATE",
         "ACR_FALLBACK_ENABLED",
@@ -686,4 +688,81 @@ fn field_description_all_fields() {
             suffix
         );
     }
+}
+
+#[test]
+fn warn_llm_files_settings_default_set_and_override() {
+    let cfg = AppConfig::default();
+    assert!(cfg.warn_llm_files_enabled);
+    assert_eq!(cfg.warn_llm_files_threshold, 20);
+
+    let mut cfg = AppConfig::default();
+    cfg.set_field("WARN_LLM_FILES_ENABLED", "0").unwrap();
+    cfg.set_field("WARN_LLM_FILES_THRESHOLD", "5").unwrap();
+    assert!(!cfg.warn_llm_files_enabled);
+    assert_eq!(cfg.warn_llm_files_threshold, 5);
+    assert!(cfg.set_field("WARN_LLM_FILES_THRESHOLD", "nope").is_err());
+    assert_eq!(cfg.env_value("WARN_LLM_FILES_ENABLED").unwrap(), "0");
+    assert_eq!(cfg.env_value("WARN_LLM_FILES_THRESHOLD").unwrap(), "5");
+    assert!(field_description("WARN_LLM_FILES_ENABLED").contains("LLM"));
+
+    let mut cfg = AppConfig::default();
+    cfg.apply_overrides(&["warn-llm-files-threshold=9".to_string()])
+        .unwrap();
+    assert_eq!(cfg.warn_llm_files_threshold, 9);
+}
+
+#[test]
+#[serial]
+fn warn_llm_files_settings_load_from_global_toml() {
+    let repo = common::init_git_repo();
+    let _cwd = DirGuard::enter(repo.path());
+    let cfg_dir = tempfile::TempDir::new().expect("tempdir");
+    let _acr = EnvGuard::clear(&acr_env_keys());
+    let _env = EnvGuard::set(&[("ACR_CONFIG_HOME", cfg_dir.path().to_string_lossy().as_ref())]);
+
+    let global_path = global_config_path().expect("global path");
+    fs::create_dir_all(global_path.parent().unwrap()).unwrap();
+    fs::write(
+        &global_path,
+        "warn_llm_files_enabled = false\nwarn_llm_files_threshold = 3\n",
+    )
+    .unwrap();
+
+    let cfg = AppConfig::load().unwrap();
+    assert!(!cfg.warn_llm_files_enabled);
+    assert_eq!(cfg.warn_llm_files_threshold, 3);
+}
+
+#[test]
+#[serial]
+fn warn_llm_files_env_and_local_save_roundtrip() {
+    let repo = common::init_git_repo();
+    let _cwd = DirGuard::enter(repo.path());
+    let _global = GlobalConfigGuard::backup();
+    let cfg_dir = tempfile::TempDir::new().expect("tempdir");
+    let _env = EnvGuard::set(&[
+        ("ACR_CONFIG_HOME", cfg_dir.path().to_string_lossy().as_ref()),
+        ("XDG_CONFIG_HOME", cfg_dir.path().to_string_lossy().as_ref()),
+        ("HOME", cfg_dir.path().to_string_lossy().as_ref()),
+        ("APPDATA", cfg_dir.path().to_string_lossy().as_ref()),
+    ]);
+    let _acr = EnvGuard::clear(&acr_env_keys());
+    let _force = EnvGuard::set(&[
+        ("ACR_CONFIG_HOME", cfg_dir.path().to_string_lossy().as_ref()),
+        ("ACR_WARN_LLM_FILES_ENABLED", "0"),
+        ("ACR_WARN_LLM_FILES_THRESHOLD", "4"),
+    ]);
+
+    let cfg = AppConfig::load().expect("config should load");
+    assert!(!cfg.warn_llm_files_enabled);
+    assert_eq!(cfg.warn_llm_files_threshold, 4);
+
+    let mut save_cfg = AppConfig::default();
+    save_cfg.warn_llm_files_threshold = 11;
+    save_cfg
+        .save_local_overrides(&HashSet::from(["WARN_LLM_FILES_THRESHOLD".to_string()]))
+        .unwrap();
+    let saved = fs::read_to_string(repo.path().join(".env")).unwrap();
+    assert!(saved.contains("ACR_WARN_LLM_FILES_THRESHOLD=\"11\""));
 }

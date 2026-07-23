@@ -49,6 +49,10 @@ pub struct AppConfig {
     #[serde(default = "default_warn_staged_files_threshold")]
     pub warn_staged_files_threshold: usize,
     #[serde(default = "default_true")]
+    pub warn_llm_files_enabled: bool,
+    #[serde(default = "default_warn_llm_files_threshold")]
+    pub warn_llm_files_threshold: usize,
+    #[serde(default = "default_true")]
     pub confirm_new_version: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_update: Option<bool>,
@@ -86,6 +90,8 @@ struct PartialAppConfig {
     suppress_tool_output: Option<bool>,
     warn_staged_files_enabled: Option<bool>,
     warn_staged_files_threshold: Option<usize>,
+    warn_llm_files_enabled: Option<bool>,
+    warn_llm_files_threshold: Option<usize>,
     confirm_new_version: Option<bool>,
     auto_update: Option<bool>,
     fallback_enabled: Option<bool>,
@@ -129,6 +135,9 @@ fn default_gitmoji_format() -> String {
     "unicode".into()
 }
 fn default_warn_staged_files_threshold() -> usize {
+    20
+}
+fn default_warn_llm_files_threshold() -> usize {
     20
 }
 fn default_diff_exclude_globs() -> Vec<String> {
@@ -193,6 +202,8 @@ impl Default for AppConfig {
             suppress_tool_output: false,
             warn_staged_files_enabled: true,
             warn_staged_files_threshold: default_warn_staged_files_threshold(),
+            warn_llm_files_enabled: true,
+            warn_llm_files_threshold: default_warn_llm_files_threshold(),
             confirm_new_version: true,
             auto_update: None,
             fallback_enabled: true,
@@ -222,6 +233,8 @@ const ENV_FIELD_MAP: &[(&str, &str)] = &[
     ("SUPPRESS_TOOL_OUTPUT", "suppress_tool_output"),
     ("WARN_STAGED_FILES_ENABLED", "warn_staged_files_enabled"),
     ("WARN_STAGED_FILES_THRESHOLD", "warn_staged_files_threshold"),
+    ("WARN_LLM_FILES_ENABLED", "warn_llm_files_enabled"),
+    ("WARN_LLM_FILES_THRESHOLD", "warn_llm_files_threshold"),
     ("CONFIRM_NEW_VERSION", "confirm_new_version"),
     ("AUTO_UPDATE", "auto_update"),
     ("FALLBACK_ENABLED", "fallback_enabled"),
@@ -326,6 +339,8 @@ impl AppConfig {
             suppress_tool_output,
             warn_staged_files_enabled,
             warn_staged_files_threshold,
+            warn_llm_files_enabled,
+            warn_llm_files_threshold,
             confirm_new_version,
             fallback_enabled,
             track_generated_commits,
@@ -504,6 +519,20 @@ impl AppConfig {
                 self.warn_staged_files_threshold.to_string(),
             ),
             (
+                "Warn LLM Files",
+                "WARN_LLM_FILES_ENABLED",
+                if self.warn_llm_files_enabled {
+                    "enabled".into()
+                } else {
+                    "disabled".into()
+                },
+            ),
+            (
+                "LLM Warn Threshold",
+                "WARN_LLM_FILES_THRESHOLD",
+                self.warn_llm_files_threshold.to_string(),
+            ),
+            (
                 "Confirm New Version",
                 "CONFIRM_NEW_VERSION",
                 if self.confirm_new_version {
@@ -591,6 +620,8 @@ impl AppConfig {
         let warnings_keys: &[&'static str] = &[
             "WARN_STAGED_FILES_ENABLED",
             "WARN_STAGED_FILES_THRESHOLD",
+            "WARN_LLM_FILES_ENABLED",
+            "WARN_LLM_FILES_THRESHOLD",
             "CONFIRM_NEW_VERSION",
             "AUTO_UPDATE",
         ];
@@ -675,6 +706,12 @@ impl AppConfig {
             "WARN_STAGED_FILES_THRESHOLD" => {
                 self.warn_staged_files_threshold = parse_usize(value)?;
             }
+            "WARN_LLM_FILES_ENABLED" => {
+                self.warn_llm_files_enabled = parse_bool(value)?;
+            }
+            "WARN_LLM_FILES_THRESHOLD" => {
+                self.warn_llm_files_threshold = parse_usize(value)?;
+            }
             "CONFIRM_NEW_VERSION" => {
                 self.confirm_new_version = parse_bool(value)?;
             }
@@ -738,6 +775,8 @@ impl AppConfig {
             "SUPPRESS_TOOL_OUTPUT" => bool_value(self.suppress_tool_output),
             "WARN_STAGED_FILES_ENABLED" => bool_value(self.warn_staged_files_enabled),
             "WARN_STAGED_FILES_THRESHOLD" => self.warn_staged_files_threshold.to_string(),
+            "WARN_LLM_FILES_ENABLED" => bool_value(self.warn_llm_files_enabled),
+            "WARN_LLM_FILES_THRESHOLD" => self.warn_llm_files_threshold.to_string(),
             "CONFIRM_NEW_VERSION" => bool_value(self.confirm_new_version),
             "AUTO_UPDATE" => self.auto_update.map(bool_value).unwrap_or_default(),
             "FALLBACK_ENABLED" => bool_value(self.fallback_enabled),
@@ -1113,6 +1152,8 @@ pub fn field_description(suffix: &str) -> &'static str {
         "SUPPRESS_TOOL_OUTPUT" => "Hide git command output when enabled",
         "WARN_STAGED_FILES_ENABLED" => "Warn when staged file count exceeds threshold",
         "WARN_STAGED_FILES_THRESHOLD" => "Number of staged files before warning is shown",
+        "WARN_LLM_FILES_ENABLED" => "Warn when the count of files sent to the LLM exceeds threshold",
+        "WARN_LLM_FILES_THRESHOLD" => "Number of LLM-analyzed files before warning is shown",
         "CONFIRM_NEW_VERSION" => "Ask for confirmation before creating version tags",
         "AUTO_UPDATE" => "Automatically update cgen when new versions are available",
         "FALLBACK_ENABLED" => "Try fallback presets if primary LLM call fails",
@@ -1242,6 +1283,7 @@ mod tests {
         assert_eq!(default_commit_template(), "$msg");
         assert_eq!(default_gitmoji_format(), "unicode");
         assert_eq!(default_warn_staged_files_threshold(), 20);
+        assert_eq!(default_warn_llm_files_threshold(), 20);
     }
 
     #[test]
@@ -1503,6 +1545,8 @@ mod tests {
         map.insert("ACR_SUPPRESS_TOOL_OUTPUT".into(), "true".into());
         map.insert("ACR_WARN_STAGED_FILES_ENABLED".into(), "false".into());
         map.insert("ACR_WARN_STAGED_FILES_THRESHOLD".into(), "50".into());
+        map.insert("ACR_WARN_LLM_FILES_ENABLED".into(), "false".into());
+        map.insert("ACR_WARN_LLM_FILES_THRESHOLD".into(), "8".into());
         map.insert("ACR_CONFIRM_NEW_VERSION".into(), "false".into());
         map.insert("ACR_AUTO_UPDATE".into(), "true".into());
         map.insert("ACR_FALLBACK_ENABLED".into(), "false".into());
@@ -1526,6 +1570,8 @@ mod tests {
         assert!(cfg.suppress_tool_output);
         assert!(!cfg.warn_staged_files_enabled);
         assert_eq!(cfg.warn_staged_files_threshold, 50);
+        assert!(!cfg.warn_llm_files_enabled);
+        assert_eq!(cfg.warn_llm_files_threshold, 8);
         assert!(!cfg.confirm_new_version);
         assert_eq!(cfg.auto_update, Some(true));
         assert!(!cfg.fallback_enabled);
@@ -1586,6 +1632,8 @@ mod tests {
             suppress_tool_output: Some(true),
             warn_staged_files_enabled: Some(false),
             warn_staged_files_threshold: Some(100),
+            warn_llm_files_enabled: Some(false),
+            warn_llm_files_threshold: Some(7),
             confirm_new_version: Some(false),
             auto_update: Some(true),
             fallback_enabled: Some(false),
@@ -1602,6 +1650,8 @@ mod tests {
         assert_eq!(cfg.api_headers, r#"{"x-api-key":"test"}"#);
         assert_eq!(cfg.auto_update, Some(true));
         assert_eq!(cfg.max_diff_bytes, 123_456);
+        assert!(!cfg.warn_llm_files_enabled);
+        assert_eq!(cfg.warn_llm_files_threshold, 7);
         assert_eq!(cfg.sensitive_file_globs, vec!["*.secret"]);
     }
 

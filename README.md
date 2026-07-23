@@ -139,6 +139,8 @@ comments; choosing “Inherit global value” removes that local assignment.
 | `ACR_SUPPRESS_TOOL_OUTPUT` | `0` | Suppress git subprocess output (`1`/`0`) |
 | `ACR_WARN_STAGED_FILES_ENABLED` | `1` | Warn when staged file count exceeds threshold (`1`/`0`) |
 | `ACR_WARN_STAGED_FILES_THRESHOLD` | `20` | Staged files warning threshold (warn when count is greater) |
+| `ACR_WARN_LLM_FILES_ENABLED` | `1` | Warn when the count of files sent to the LLM exceeds threshold (`1`/`0`) |
+| `ACR_WARN_LLM_FILES_THRESHOLD` | `20` | LLM-analyzed files warning threshold (warn when count is greater) |
 | `ACR_CONFIRM_NEW_VERSION` | `1` | Ask before creating the computed `--tag` version (`1`/`0`) |
 | `ACR_AUTO_UPDATE` | unset | Enable automatic updates (`1`/`0`); prompts on first run if unset |
 | `ACR_FALLBACK_ENABLED` | `1` | Try fallback presets when primary LLM fails (`1`/`0`) |

@@ -550,6 +550,19 @@ fn edit_field(suffix: &str, cfg: &AppConfig) -> Option<String> {
             )
             .prompt()
             .ok(),
+        "WARN_LLM_FILES_ENABLED" => {
+            let choices = vec!["enabled", "disabled"];
+            Select::new("Warn when LLM-analyzed files exceed threshold:", choices)
+                .prompt()
+                .ok()
+                .map(|v| if v == "enabled" { "1" } else { "0" }.to_string())
+        }
+        "WARN_LLM_FILES_THRESHOLD" => Text::new("Warn threshold (files sent to LLM):")
+            .with_help_message(
+                "Integer value; warning shows when count is greater than this threshold",
+            )
+            .prompt()
+            .ok(),
         "CONFIRM_NEW_VERSION" => {
             let choices = vec!["enabled", "disabled"];
             Select::new("Confirm new semantic version tag:", choices)
