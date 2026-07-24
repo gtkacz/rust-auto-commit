@@ -730,27 +730,69 @@ fn detect_secret_findings(diff: &str) -> Vec<String> {
         )
         .unwrap()
     });
-    let mut findings = Vec::new();
-    for line in diff
-        .lines()
-        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-    {
+    let mut findings: Vec<String> = Vec::new();
+    let mut path = None;
+    let mut new_line = None;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            path = diff_header_path(line).ok();
+            new_line = None;
+            continue;
+        }
+        if let Some(hunk) = line.strip_prefix("@@ ") {
+            new_line = hunk
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix('+'))
+                .and_then(|part| {
+                    part.split_once(',')
+                        .map_or(Some(part), |(start, _)| Some(start))
+                })
+                .and_then(|start| start.parse::<usize>().ok());
+            continue;
+        }
+        if line.starts_with(' ') {
+            if let Some(line_number) = &mut new_line {
+                *line_number += 1;
+            }
+            continue;
+        }
+        if !line.starts_with('+') || line.starts_with("+++") {
+            continue;
+        }
+
         let lower = line.to_ascii_lowercase();
         if lower.contains("$acr_")
             || lower.contains("example")
             || lower.contains("placeholder")
             || lower.contains("[redacted]")
+            || lower.contains("your-key-here")
         {
+            if let Some(line_number) = &mut new_line {
+                *line_number += 1;
+            }
             continue;
         }
+        let location = match (&path, new_line) {
+            (Some(path), Some(line_number)) => format!("{path}:{line_number}"),
+            (Some(path), None) => path.clone(),
+            (None, _) => "unknown location".to_string(),
+        };
         if high_confidence.is_match(line) {
-            if !findings.contains(&"credential-like token or private key".to_string()) {
-                findings.push("credential-like token or private key".to_string());
+            if !findings
+                .iter()
+                .any(|finding| finding.starts_with("credential-like token or private key"))
+            {
+                findings.push(format!("credential-like token or private key ({location})"));
             }
         } else if assignment.is_match(line)
-            && !findings.contains(&"secret-like assignment".to_string())
+            && !findings
+                .iter()
+                .any(|finding| finding.starts_with("secret-like assignment"))
         {
-            findings.push("secret-like assignment".to_string());
+            findings.push(format!("secret-like assignment ({location})"));
+        }
+        if let Some(line_number) = &mut new_line {
+            *line_number += 1;
         }
     }
     findings
@@ -1114,7 +1156,7 @@ diff --git a/src/app.ts b/src/app.ts
 
     #[test]
     fn test_diff_safety_detects_sensitive_paths_and_secret_additions() {
-        let diff = "diff --git a/.env b/.env\n+API_KEY=abcdefghijklmnop1234\n";
+        let diff = "diff --git a/.env b/.env\n@@ -0,0 +1 @@\n+API_KEY=abcdefghijklmnop1234\n";
         let files = vec![".env".to_string(), "src/lib.rs".to_string()];
         let patterns = vec![".env".to_string()];
         let report = assess_diff_safety(diff, &files, &patterns).unwrap();
@@ -1122,6 +1164,15 @@ diff --git a/src/app.ts b/src/app.ts
         assert_eq!(report.omitted_files, vec!["src/lib.rs"]);
         assert!(report
             .secret_findings
-            .contains(&"secret-like assignment".to_string()));
+            .iter()
+            .any(|finding| finding == "secret-like assignment (.env:1)"));
+    }
+
+    #[test]
+    fn test_diff_safety_ignores_documented_key_placeholder() {
+        let diff =
+            "diff --git a/README.md b/README.md\n@@ -1 +1 @@\n+export ACR_API_KEY=your-key-here\n";
+        let report = assess_diff_safety(diff, &["README.md".to_string()], &[]).unwrap();
+        assert!(report.secret_findings.is_empty());
     }
 }

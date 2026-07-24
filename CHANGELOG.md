@@ -7,11 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Lorem Ipsum
+
+### Changed
+
+- Lorem Ipsum
+
+### Fixed
+
+- Lorem ipsum
+
+## [1.4.1] - 2026-07-23
+
 ### Changed
 
 - Updated all Rust dependencies, including the `ureq` 3, `toml` 1.1, `sha2` 0.11, `inquire` 0.9, `colored` 3, and `shlex` 2 major releases
 - Raised the MSRV to Rust 1.85, the minimum required by the updated dependency graph
 - Updated GitHub Actions to their current supported major releases
+
+### Fixed
+
+- Try fallback presets when a provider rejects a request as too large (`HTTP 413`)
+- Include the path and line number for sensitive-content findings, and ignore the documented `your-key-here` API-key placeholder
 
 ## [1.4.0] - 2026-07-23
 

@@ -24,4 +24,5 @@ a slash match repository-relative paths; basename patterns such as `*.lock`
 match at any depth. Invalid patterns and filters that remove every changed file
 are errors. The same filters apply to normal generation and `cgen alter`.
 
-Note: `ACR_AUTO_UPDATE` is a global-only setting and is not written to local `.env` files.
+Excluded files are still committed — the patterns only control what the LLM
+sees. To keep files out of the commit itself, don't stage them.

@@ -232,14 +232,13 @@ fn call_llm_interpolates_custom_headers_and_url_variables() {
 
 #[test]
 #[serial]
-fn call_llm_with_fallback_tries_next_preset() {
+fn call_llm_with_fallback_tries_next_preset_after_payload_too_large() {
     let mut server = Server::new();
 
-    // Primary fails
     let mock_primary = server
         .mock("POST", "/primary")
-        .with_status(500)
-        .with_body("server error")
+        .with_status(413)
+        .with_body("request too large")
         .create();
 
     // Fallback succeeds

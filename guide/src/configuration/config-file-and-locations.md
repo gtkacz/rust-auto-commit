@@ -7,6 +7,11 @@ keys that project overrides, and every absent key continues to inherit from
 global config/defaults. Saving local config preserves unrelated variables and
 comments; choosing "Inherit global value" removes that local assignment.
 
+`ACR_AUTO_UPDATE` is the one global-only setting: it is never written to local
+`.env` files and cannot be overridden with `--set`.
+
+## Settings Reference
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ACR_PROVIDER` | `groq` | LLM provider (`groq`, `openai`, `anthropic`, `gemini`, `grok`, `deepseek`, `openrouter`, `mistral`, `together`, `fireworks`, `perplexity`, `lm_studio`, `ollama`, or custom) |
@@ -31,12 +36,23 @@ comments; choosing "Inherit global value" removes that local assignment.
 | `ACR_AUTO_UPDATE` | unset | Enable automatic updates (`1`/`0`); prompts on first run if unset |
 | `ACR_FALLBACK_ENABLED` | `1` | Try fallback presets when primary LLM fails (`1`/`0`) |
 | `ACR_TRACK_GENERATED_COMMITS` | `1` | Track AI-generated commits per repository (`1`/`0`) |
-| `ACR_DIFF_EXCLUDE_GLOBS` | (see below) | Comma-separated glob patterns for files to exclude from LLM analysis |
+| `ACR_DIFF_EXCLUDE_GLOBS` | (see [Diff Exclusion Patterns](diff-exclusion-patterns.md)) | Comma-separated glob patterns for files to exclude from LLM analysis |
 | `ACR_MAX_DIFF_BYTES` | `200000` | Maximum filtered diff bytes accepted without `--allow-large-diff` |
 | `ACR_MAX_OUTPUT_TOKENS` | `512` | Maximum tokens the LLM may generate for one commit message |
-| `ACR_SENSITIVE_FILE_GLOBS` | `.env,.env.*,...` | Paths that require `--allow-sensitive` before LLM analysis |
+| `ACR_SENSITIVE_FILE_GLOBS` | `.env,.env.*,*.pem,*.key,id_rsa,id_ed25519,*credentials*,*secrets*` | Paths that require `--allow-sensitive` before LLM analysis |
 
 ## Config Locations
 
 - **Global**: `~/.config/cgen/config.toml` (Linux), `~/Library/Application Support/cgen/config.toml` (macOS), `%APPDATA%\cgen\config.toml` (Windows)
 - **Local**: `.env` in git repo root
+
+## The `cgen config` editor
+
+`cgen config` edits these files interactively. Inside a git repo it asks
+whether to edit local or global settings; outside a repo it opens the global
+config directly. The menu groups settings, supports **Show descriptions [?]**
+(inline help for each setting) and **Search settings [/]** (auto-expands
+matching groups), and includes entries for managing
+[presets](../providers/presets.md) and
+[fallback order](../providers/fallback-order.md). Changing the provider
+automatically resets the model to that provider's default.

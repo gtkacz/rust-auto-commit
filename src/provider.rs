@@ -168,7 +168,9 @@ impl LlmCallError {
         match self {
             Self::TransportError(_) => true,
             Self::HttpError { code, .. } => {
-                matches!(*code, 408 | 409 | 425 | 429) || (500..=599).contains(code)
+                // A provider can reject a request as too large for its current
+                // model or quota while another configured provider accepts it.
+                matches!(*code, 408 | 409 | 413 | 425 | 429) || (500..=599).contains(code)
             }
             Self::Other(_) => false,
         }
