@@ -28,51 +28,18 @@ Tools like [opencommit](https://github.com/di-sukharev/opencommit) do the same t
 
 ## Install
 
-### Linux / macOS (curl)
-
 ```sh
+# Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/gtkacz/smart-commit-rs/main/scripts/install.sh | bash
-```
 
-This detects your OS and architecture, downloads the latest release binary to `/usr/local/bin`, and makes it executable. Set `INSTALL_DIR` to change the target:
-
-```sh
-INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/gtkacz/smart-commit-rs/main/scripts/install.sh | bash
-```
-
-### Windows (PowerShell)
-
-```powershell
+# Windows (PowerShell)
 irm https://raw.githubusercontent.com/gtkacz/smart-commit-rs/main/scripts/install.ps1 | iex
-```
 
-This downloads the latest release to `%LOCALAPPDATA%\cgen\` and adds it to your user PATH.
-
-### Cargo
-
-From [crates.io](https://crates.io/crates/auto-commit-rs):
-
-```sh
+# Cargo
 cargo install auto-commit-rs
 ```
 
-From git:
-
-```sh
-cargo install --git https://github.com/gtkacz/smart-commit-rs
-```
-
-### Manual Download
-
-Grab a binary from the [Releases](https://github.com/gtkacz/smart-commit-rs/releases) page and place it somewhere in your PATH.
-
-Available binaries:
-- `cgen-linux-amd64`, Linux x86_64
-- `cgen-linux-amd64-musl`, portable Linux x86_64
-- `cgen-linux-arm64`, Linux ARM64
-- `cgen-macos-amd64`, macOS Intel
-- `cgen-macos-arm64`, macOS Apple Silicon
-- `cgen-windows-amd64.exe`, Windows x86_64
+→ [Full installation instructions](https://gtkacz.github.io/smart-commit-rs/getting-started/installation.html) (manual download, custom install directory, binaries per platform).
 
 ## Quick Start
 
@@ -91,35 +58,20 @@ cgen
 ```
 cgen                    # Generate commit message and commit
 cgen --dry-run          # Generate and show message without committing
-cgen --verbose          # Print final system prompt used for LLM call (diff omitted)
-cgen --tag              # Create next semantic version tag after commit
-cgen --set model=gpt-4o      # Override any setting for this run only (repeatable)
-cgen --diff-include "*.xml"  # Force-include matching files in the LLM diff (repeatable)
-cgen --diff-exclude "*.sql"  # Exclude extra files from the LLM diff this run (repeatable)
-cgen --allow-large-diff      # Explicitly allow a payload over the configured byte budget
-cgen --allow-sensitive       # Explicitly allow a diff flagged as sensitive
-cgen --no-verify        # Forward flags to git commit
-cgen alter <hash>       # Regenerate message from that commit's diff and rewrite it
-cgen alter <old> <new>  # Use old..new net diff, rewrite <new> message
-cgen undo               # Undo latest commit with safety prompts (soft reset)
-cgen update             # Update cgen to the latest version
 cgen config             # Interactive config editor (auto-detects scope)
-cgen prompt             # Print the LLM system prompt without running anything
-cgen history            # Browse AI-generated commits for the current repo
-cgen preset             # Manage LLM presets (same UI as config menu entry)
-cgen fallback           # Configure fallback order (same UI as config menu entry)
+cgen alter <hash>       # Regenerate message from that commit's diff and rewrite it
+cgen undo               # Undo latest commit with safety prompts (soft reset)
 ```
 
 Any arguments passed to `cgen` (without a subcommand) are forwarded directly to `git commit`.
+
+→ [Full command reference](https://gtkacz.github.io/smart-commit-rs/usage.html).
 
 ## Configuration
 
 All settings use the `ACR_` prefix. Layered resolution is defaults → global
 TOML → local `.env` → process environment → CLI `--set` (highest priority,
-this run only). A project `.env` is a sparse overlay: it may contain only the
-keys that project overrides, and every absent key continues to inherit from
-global config/defaults. Saving local config preserves unrelated variables and
-comments; choosing “Inherit global value” removes that local assignment.
+this run only).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -150,168 +102,17 @@ comments; choosing “Inherit global value” removes that local assignment.
 | `ACR_MAX_OUTPUT_TOKENS` | `512` | Maximum tokens the LLM may generate for one commit message |
 | `ACR_SENSITIVE_FILE_GLOBS` | `.env,.env.*,...` | Paths that require `--allow-sensitive` before LLM analysis |
 
-### Per-Invocation Overrides
+Global config: `~/.config/cgen/config.toml` (Linux), `~/Library/Application Support/cgen/config.toml` (macOS), `%APPDATA%\cgen\config.toml` (Windows). Local override: `.env` in the git repo root.
 
-Any setting can be overridden for a single run with `--set KEY=VALUE` (repeatable). Overrides apply on top of all other layers and are **never persisted**:
-
-```sh
-cgen --set model=gpt-4o --set one_liner=false
-cgen --set provider=ollama        # try a different provider just this once
-```
-
-Keys are the setting names from the table above (case-insensitive; `-` and `_` are interchangeable, e.g. `one-liner`). Every setting is overridable except `auto_update` (a persistent global preference). Unknown keys are rejected with the list of valid keys.
-
-To refine which files are sent to the LLM for one run, use `--diff-include`/`--diff-exclude` (see [Diff Exclusion Patterns](#diff-exclusion-patterns)).
-
-Generation flags are global and may appear before or after a subcommand.
-Always quote globs so your shell does not expand them:
-`--diff-include "*.xml"`.
-
-### Diff Exclusion Patterns
-
-`ACR_DIFF_EXCLUDE_GLOBS` filters files from the diff sent to the LLM while still committing them. This reduces noise and token usage for binary, generated, or data files. Default patterns:
-
-```
-*.json, *.xml, *.csv, *.pdf, *.lock, *.svg, *.png, *.jpg, *.jpeg, *.gif, *.ico, *.woff, *.woff2, *.ttf, *.eot, *.min.js, *.min.css
-```
-
-Override with a comma-separated list:
-
-```sh
-export ACR_DIFF_EXCLUDE_GLOBS="*.lock,*.svg,package-lock.json"
-```
-
-For a single run, adjust the effective filter without touching your config:
-
-```sh
-cgen --diff-include "*.xml"   # send .xml files to the LLM even though they're excluded
-cgen --diff-exclude "*.sql"   # additionally drop .sql files from the LLM diff
-```
-
-`--diff-include` wins over any exclude pattern (allow-over-deny). Patterns with
-a slash match repository-relative paths; basename patterns such as `*.lock`
-match at any depth. Invalid patterns and filters that remove every changed file
-are errors. The same filters apply to normal generation and `cgen alter`.
-
-Note: `ACR_AUTO_UPDATE` is a global-only setting and is not written to local `.env` files.
-
-### Config Locations
-
-- **Global**: `~/.config/cgen/config.toml` (Linux), `~/Library/Application Support/cgen/config.toml` (macOS), `%APPDATA%\cgen\config.toml` (Windows)
-- **Local**: `.env` in git repo root
-
-### Variable Interpolation
-
-`ACR_API_URL` and `ACR_API_HEADERS` support `$VARIABLE` interpolation from environment variables:
-
-```sh
-ACR_API_URL=https://api.example.com/v1/$ACR_MODEL/chat
-ACR_API_HEADERS=Authorization: Bearer $ACR_API_KEY, X-Custom: $MY_HEADER
-```
-
-Missing variables are errors. Interpolation never mutates the process
-environment. Header overrides may use the legacy comma-separated form above or
-a JSON object with string values.
-
-### Safety and Workflow Controls
-
-- `cgen` prints staged file count and names before generating a commit message; files excluded from the LLM payload are marked `(not sent to LLM)`.
-- If staged files exceed `ACR_WARN_STAGED_FILES_THRESHOLD`, or the files actually sent to the LLM exceed `ACR_WARN_LLM_FILES_THRESHOLD`, cgen asks one merged confirmation (including the payload size in KB) before continuing. Each check can be disabled with its `_ENABLED` flag.
-- `cgen --dry-run` generates and prints the final commit message but does not create a commit.
-- `cgen --verbose` prints the final system prompt sent to the LLM and never prints diff payload.
-- Sensitive filenames and high-confidence credential patterns are blocked before any provider request; use `--allow-sensitive` only after reviewing the exact staged diff.
-- Filtered diffs above `ACR_MAX_DIFF_BYTES` are blocked before any provider request; `--allow-large-diff` is an explicit one-run override.
-- `cgen prompt` prints the full LLM system prompt (based on current config) without running any LLM call or git operations.
-- `cgen config` auto-detects the context: inside a git repo it asks whether to edit local or global settings; outside a repo it opens the global config directly.
-- The config view includes additional features:
-  - **Show descriptions [?]**: toggle to display help text for each setting
-  - **Search settings [/]**: find settings by name (auto-expands matching groups)
-  - Groups and subgroups are color-coded for easier navigation
-- `cgen alter --dry-run` generates and prints the rewritten message but does not rewrite history.
-- `cgen --tag` creates a semantic version tag after a successful commit:
-  - no existing tag -> `0.1.0`
-  - latest semver tag `x.y.z` -> `x.(y+1).0`
-  - latest tag not in semantic versioning -> error
-- If `ACR_CONFIRM_NEW_VERSION=1`, cgen asks before creating the computed tag; if `0`, it creates it directly.
-- `cgen alter <old> <new>` uses the `old..new` net diff as LLM input and rewrites only the `<new>` commit message.
-- If `cgen alter` targets an already-pushed commit, cgen requires explicit confirmation before rewriting.
-- After a real commit, push behavior follows `ACR_POST_COMMIT_PUSH`:
-  - `never`: never push
-  - `ask`: prompt whether to push (default)
-  - `always`: push automatically
-- For rewritten pushed history, cgen offers a separate, default-No `git push --force-with-lease` action; it never performs an unguarded force push.
-- `cgen undo` only undoes the latest commit, keeps its changes staged (including a repository’s root commit), never pushes, and warns before undoing pushed commits.
-- A tag created with `--tag` is pushed explicitly after a successful branch push; partial failures report that the tag remains local.
-
-### Updating
-
-- `cgen update` updates the installation that launched it:
-  - Cargo installations run `cargo install auto-commit-rs --version <release> --locked --force`.
-  - Release installations download the selected platform artifact and `checksums.sha256`, verify SHA-256, then atomically replace (or, on Windows, schedule replacement of) that executable.
-- On every run, cgen checks the latest GitHub release tag against the current version.
-- The first time cgen runs, it asks whether to enable automatic updates and saves the preference to the global config.
-- If `ACR_AUTO_UPDATE=1`, cgen automatically updates when a newer version is found.
-- If `ACR_AUTO_UPDATE=0` (or unset after the prompt), a warning is shown at the end of the output with the available version.
-
-### LLM Presets
-
-Presets let you save and reuse LLM provider configurations. Manage them from the `cgen config` interactive menu:
-
-- **Save current as preset**: saves the current provider/model/key/url/headers as a named preset
-- **Load a preset**: applies a saved preset to the current config session
-- **Manage presets**: create, rename, duplicate, delete, export, and import presets
-- **Export/Import**: export presets as TOML (optionally redacting API keys) for sharing or backup
-
-Presets are stored in `{config_dir}/cgen/presets.toml` alongside the global config. Deduplication uses `(provider, model, api_key, api_url)` as the key.
-
-### Fallback Order
-
-When `ACR_FALLBACK_ENABLED=1` (default) and the primary LLM has a transient
-failure, cgen tries fallback presets in the configured order. All attempts share
-one total 120-second deadline.
-
-- Configure fallback order from the `cgen config` menu under "Configure fallback order..."
-- Presets matching the current config are skipped
-- Transport failures and HTTP 408/409/425/429/5xx may fall back
-- Authentication, invalid-request, configuration, and response-format errors stop immediately
-- A summary of all failures is shown if every provider fails
-
-### Commit History
-
-When `ACR_TRACK_GENERATED_COMMITS=1` (default), cgen records each AI-generated commit hash and message preview in a per-repository cache.
-
-- `cgen history` inside a git repo shows that repo's tracked commits
-- `cgen history` outside a git repo lists all tracked repos, then shows commits for the selected one
-- Selecting a commit runs `git show` on it
-- Cache is stored in `{config_dir}/cgen/cache/`, is concurrency-safe, deduplicates rewritten hashes, and retains the latest 200 entries per repository
+→ Full details: [per-invocation overrides](https://gtkacz.github.io/smart-commit-rs/configuration/per-invocation-overrides.html), [variable interpolation](https://gtkacz.github.io/smart-commit-rs/configuration/variable-interpolation.html), [diff exclusion patterns](https://gtkacz.github.io/smart-commit-rs/configuration/diff-exclusion-patterns.html), [safety & workflow controls](https://gtkacz.github.io/smart-commit-rs/configuration/safety-and-workflow-controls.html), and [updating](https://gtkacz.github.io/smart-commit-rs/configuration/updating.html).
 
 ## Providers
 
-Built-in providers: **Groq** (default), **OpenAI**, **Anthropic**, **Gemini**, **Grok**, **DeepSeek**, **OpenRouter**, **Mistral**, **Together**, **Fireworks**, **Perplexity**, **LM Studio**, **Ollama**.
+Built-in providers: **Groq** (default), **OpenAI**, **Anthropic**, **Gemini**, **Grok**, **DeepSeek**, **OpenRouter**, **Mistral**, **Together**, **Fireworks**, **Perplexity**, **LM Studio**, **Ollama** — plus any OpenAI-compatible custom endpoint.
 
-| Provider | Default Model |
-|----------|---------------|
-| groq | llama-3.3-70b-versatile |
-| openai | gpt-4o-mini |
-| anthropic | claude-sonnet-4-20250514 |
-| gemini | gemini-2.0-flash |
-| grok | grok-3 |
-| deepseek | deepseek-chat |
-| openrouter | openai/gpt-4o-mini |
-| mistral | mistral-small-latest |
-| together | meta-llama/Llama-3.3-70B-Instruct-Turbo |
-| fireworks | accounts/fireworks/models/llama-v3p3-70b-instruct |
-| perplexity | sonar |
-| lm_studio | qwen/qwen3.5-35b-a3b |
-| ollama | llama3 |
+→ [Full provider list and defaults](https://gtkacz.github.io/smart-commit-rs/providers/built-in-providers.html), [presets](https://gtkacz.github.io/smart-commit-rs/providers/presets.html), and [fallback order](https://gtkacz.github.io/smart-commit-rs/providers/fallback-order.html).
 
-For custom providers, set `ACR_PROVIDER` to any name and provide `ACR_API_URL`. Custom providers default to OpenAI-compatible request format.
-
-```sh
-export ACR_PROVIDER=vllm
-export ACR_API_URL=http://localhost:8000/v1/chat/completions
-export ACR_MODEL=meta-llama/Llama-3-8B
-```
+`cgen history` browses previously AI-generated commits for a repository (enabled via `ACR_TRACK_GENERATED_COMMITS`). → [Details](https://gtkacz.github.io/smart-commit-rs/internals/commit-history.html).
 
 ## Testing and Coverage
 
