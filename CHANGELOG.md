@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.0] - 2026-07-28
 
 ### Added
 
@@ -16,22 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repository-local `prepare-commit-msg` management through `cgen hook`
 - Authenticated live model discovery and searchable selection through
   `cgen model` and the configuration editor
-
-### Changed
-
-- Generation, validation, fallback, templating, alter, stdout, and hook flows
-  now share one quiet-aware generation service
-- Multiple candidates receive recent results as distinct-alternative context
-  while retaining fallback and corrective validation for every provider call
-
-### Fixed
-
-- Forwarded exact `-a` / `--all` arguments now stage before diff inspection, so
-  the generated message and eventual commit always describe the same index
-- Quiet generation no longer leaks spinners, review UI, fallback notices, or
-  status text into machine-readable stdout
-- Hook installation safely chains/restores existing hooks and lets commits
-  continue when AI generation is unavailable
 
 ## [1.4.1] - 2026-07-23
 
