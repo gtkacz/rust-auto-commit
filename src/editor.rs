@@ -58,4 +58,52 @@ mod tests {
     fn default_editor_is_not_empty() {
         assert!(!default_editor().is_empty());
     }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn edit_returns_editor_output() {
+        let _guard = GitEditorGuard::set(r#"sh -c 'printf "edited message\n" > "$1"' cgen-editor"#);
+
+        assert_eq!(edit("initial message\n").unwrap(), "edited message\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn edit_reports_editor_failure() {
+        let _guard = GitEditorGuard::set("sh -c 'exit 7' cgen-editor");
+
+        let error = edit("initial message\n").unwrap_err().to_string();
+        assert!(error.contains("exited with status"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn edit_rejects_invalid_editor_command() {
+        let _guard = GitEditorGuard::set("'");
+
+        let error = edit("initial message\n").unwrap_err().to_string();
+        assert!(error.contains("Invalid editor command"));
+    }
+
+    struct GitEditorGuard(Option<std::ffi::OsString>);
+
+    impl GitEditorGuard {
+        fn set(value: &str) -> Self {
+            let original = std::env::var_os("GIT_EDITOR");
+            std::env::set_var("GIT_EDITOR", value);
+            Self(original)
+        }
+    }
+
+    impl Drop for GitEditorGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.0.take() {
+                std::env::set_var("GIT_EDITOR", value);
+            } else {
+                std::env::remove_var("GIT_EDITOR");
+            }
+        }
+    }
 }

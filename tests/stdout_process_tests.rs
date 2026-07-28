@@ -22,6 +22,9 @@ fn run_cgen(repo: &Path, config_home: &Path, api_url: &str, args: &[&str]) -> Ou
         .env("ACR_AUTO_UPDATE", "false")
         .env("ACR_REVIEW_COMMIT", "true")
         .env("ACR_POST_COMMIT_PUSH", "never");
+    if let Some(profile_file) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile_file);
+    }
     command.output().expect("failed to run cgen")
 }
 

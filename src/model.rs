@@ -321,4 +321,68 @@ mod tests {
             vec!["llama3:latest", "qwen:7b"]
         );
     }
+
+    #[test]
+    fn parses_models_family_identifiers_and_filters_capabilities() {
+        let value = json!({"models": [
+            {"key": "key-chat"},
+            {"name": "name-chat"},
+            {"model": "model-chat"},
+            {"id": "disabled", "capabilities": {"chat_completion": false}},
+            {"id": "reranker", "type": "rerank"}
+        ]});
+
+        assert_eq!(
+            parse_model_list(&value, ModelListParser::Models).unwrap(),
+            vec!["key-chat", "model-chat", "name-chat"]
+        );
+    }
+
+    #[test]
+    fn model_list_parsers_reject_missing_or_empty_arrays() {
+        for parser in [
+            ModelListParser::Data,
+            ModelListParser::Gemini,
+            ModelListParser::Models,
+            ModelListParser::Ollama,
+        ] {
+            assert!(parse_model_list(&json!({}), parser).is_err());
+        }
+        assert!(parse_model_list(&json!([]), ModelListParser::Data).is_err());
+    }
+
+    #[test]
+    fn prioritizes_current_and_default_models_without_duplicates() {
+        let cfg = AppConfig {
+            provider: "openai".into(),
+            model: "current-model".into(),
+            ..AppConfig::default()
+        };
+        let default = provider::default_model_for(&cfg.provider).to_string();
+
+        assert_eq!(
+            prioritize_models(
+                &cfg,
+                vec![
+                    "other-model".into(),
+                    default.clone(),
+                    "current-model".into()
+                ]
+            ),
+            vec![
+                "current-model".to_string(),
+                default,
+                "other-model".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_diagnostics_truncate_and_redact_secrets() {
+        let body = format!("token=secret-key {}", "x".repeat(3_000));
+        let diagnostic = bounded_diagnostic(&body, "secret-key");
+
+        assert!(!diagnostic.contains("secret-key"));
+        assert!(diagnostic.len() <= 2_048);
+    }
 }
