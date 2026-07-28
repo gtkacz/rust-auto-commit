@@ -89,3 +89,62 @@ fn global_generation_flags_parse_after_subcommand() {
     assert!(cli.allow_large_diff);
     assert!(cli.allow_sensitive);
 }
+
+#[test]
+fn parses_new_generation_flags() {
+    let cli = Cli::try_parse_from([
+        "cgen",
+        "--all",
+        "--stdout",
+        "--generate",
+        "1",
+        "--prompt",
+        "focus on compatibility",
+    ])
+    .expect("new generation flags should parse");
+    assert!(cli.all);
+    assert!(cli.stdout);
+    assert_eq!(cli.generate, 1);
+    assert_eq!(cli.prompt.as_deref(), Some("focus on compatibility"));
+}
+
+#[test]
+fn parses_short_generation_flags() {
+    let cli = Cli::try_parse_from(["cgen", "-a", "-g", "7", "-p", "concise"])
+        .expect("short flags should parse");
+    assert!(cli.all);
+    assert_eq!(cli.generate, 7);
+    assert_eq!(cli.prompt.as_deref(), Some("concise"));
+}
+
+#[test]
+fn candidate_count_must_be_positive_but_is_not_capped() {
+    assert!(Cli::try_parse_from(["cgen", "--generate", "0"]).is_err());
+    assert!(Cli::try_parse_from(["cgen", "--generate", "1000"]).is_ok());
+}
+
+#[test]
+fn prompt_guidance_must_not_be_blank() {
+    assert!(Cli::try_parse_from(["cgen", "--prompt", "   "]).is_err());
+}
+
+#[test]
+fn stdout_has_static_clap_conflicts() {
+    assert!(Cli::try_parse_from(["cgen", "--stdout", "--dry-run"]).is_err());
+    assert!(Cli::try_parse_from(["cgen", "--stdout", "--verbose"]).is_err());
+    assert!(Cli::try_parse_from(["cgen", "--stdout", "--tag"]).is_err());
+}
+
+#[test]
+fn parses_model_and_hook_commands() {
+    assert!(matches!(
+        Cli::try_parse_from(["cgen", "model"]).unwrap().command,
+        Some(Command::Model)
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["cgen", "hook", "install"])
+            .unwrap()
+            .command,
+        Some(Command::Hook { .. })
+    ));
+}

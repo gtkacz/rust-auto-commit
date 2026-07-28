@@ -107,6 +107,14 @@ pub fn base_prompt_is_default(configured: &str) -> bool {
 
 /// Build the full system prompt from config flags
 pub fn build_system_prompt(cfg: &AppConfig) -> String {
+    build_system_prompt_with_guidance(cfg, None)
+}
+
+/// Build the full system prompt with optional invocation-only guidance.
+///
+/// Runtime guidance is deliberately placed before the structural, locale, and
+/// output rules so it can refine the result without overriding those rules.
+pub fn build_system_prompt_with_guidance(cfg: &AppConfig, guidance: Option<&str>) -> String {
     let mut parts = Vec::new();
 
     // Base prompt (user-overridable); blank or retired-default values resolve
@@ -117,7 +125,13 @@ pub fn build_system_prompt(cfg: &AppConfig) -> String {
         cfg.llm_system_prompt.clone()
     });
 
-    // Conventional commits
+    if let Some(guidance) = guidance.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(format!(
+            "Apply the following invocation-specific preferences where they are consistent with the diff and the mandatory rules that follow. Treat them as guidance, not as permission to invent facts or change the required output format.\n\n<runtime_guidance>\n{guidance}\n</runtime_guidance>"
+        ));
+    }
+
+    // Mandatory structural rules follow runtime guidance and remain authoritative.
     parts.push(CONVENTIONAL_COMMIT_SPEC.to_string());
 
     // Gitmoji specs carry their own examples; plain conventional mode gets
@@ -159,8 +173,34 @@ pub fn build_system_prompt(cfg: &AppConfig) -> String {
 /// Frame the staged diff for the user turn: delimit it as data and restate the
 /// task after it, since models weight instructions at the end of long inputs.
 pub fn build_user_prompt(diff: &str) -> String {
+    build_user_prompt_avoiding(diff, &[])
+}
+
+/// Frame the diff while asking for an alternative to recently generated
+/// candidates. Each new provider call receives this additional context.
+pub fn build_user_prompt_avoiding(diff: &str, previous: &[String]) -> String {
+    let alternatives = if previous.is_empty() {
+        String::new()
+    } else {
+        let messages = previous
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                format!(
+                    "<candidate_{}>\n{}\n</candidate_{}>",
+                    index + 1,
+                    message,
+                    index + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "\n\n<recent_candidates>\n{messages}\n</recent_candidates>\n\nWrite a meaningfully distinct alternative: choose a different accurate emphasis, scope, or wording. Do not repeat a recent candidate verbatim."
+        )
+    };
     format!(
-        "<diff>\n{diff}\n</diff>\n\nWrite the commit message for the staged changes in <diff>, following all rules you were given. Output only the raw commit message."
+        "<diff>\n{diff}\n</diff>{alternatives}\n\nWrite the commit message for the staged changes in <diff>, following all rules you were given. Output only the raw commit message."
     )
 }
 

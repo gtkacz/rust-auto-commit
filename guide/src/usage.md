@@ -20,6 +20,10 @@ diff/override flags also apply to `cgen alter`.
 
 | Flag | Effect |
 |------|--------|
+| `-a`, `--all` | Run `git add --update` first, staging tracked modifications and deletions but never untracked files |
+| `--stdout` | Write exactly one final, templated message and a newline; never commit, push, tag, update, review, or track history |
+| `-g N`, `--generate N` | Generate `N` independently validated candidates and choose one (counts above five require confirmation) |
+| `-p TEXT`, `--prompt TEXT` | Add invocation-only content/style guidance without overriding format, locale, or safety rules |
 | `--dry-run` | Generate and print the message without committing (with `alter`: without rewriting) |
 | `--verbose` | Print the final system prompt sent to the LLM (never the diff payload) |
 | `--tag` | Create the next semantic version tag after a successful commit ([details](configuration/safety-and-workflow-controls.md#semantic-version-tags---tag)) |
@@ -30,6 +34,17 @@ diff/override flags also apply to `cgen alter`.
 | `--allow-sensitive` | Allow a diff flagged by the [sensitive-data guard](configuration/safety-and-workflow-controls.md#sensitive-data-guard) |
 
 Always quote globs so your shell does not expand them: `--diff-include "*.xml"`.
+
+`--stdout` is explicit: redirecting normal output does not enable it. It works
+for staged generation and `cgen --stdout alter <hash>`. It conflicts with
+`--dry-run`, `--verbose`, `--tag`, forwarded commit arguments, and candidate
+counts other than one. Diagnostics go to stderr, while the sensitive-content
+and diff-size guards remain active.
+
+When `N > 1`, `--generate N` requires an interactive terminal. Regeneration
+replaces the entire candidate set. After choosing, the normal review menu still
+appears when review is enabled; otherwise the selected candidate is committed
+immediately.
 
 ## Subcommands
 
@@ -65,6 +80,29 @@ a repository when run outside one). Requires `ACR_TRACK_GENERATED_COMMITS=1`
 Manage saved provider [presets](providers/presets.md) and the
 [fallback order](providers/fallback-order.md) directly — the same UIs available
 from the `cgen config` menu.
+
+### `cgen model`
+
+Discover live models for the configured provider, search the returned catalog,
+and save only the selected model locally or globally. The current and provider
+default models are placed first. If discovery is unsupported, times out, or
+fails, cgen explains the problem and offers the current/default values plus
+manual entry. Cancellation writes nothing.
+
+Perplexity uses manual model entry because its current model-list endpoint
+describes a different API surface. Custom OpenAI-compatible providers support
+discovery when `ACR_API_URL` has a recognizable `/chat/completions` suffix.
+
+### `cgen hook install|uninstall|status`
+
+Manage the current repository's `prepare-commit-msg` integration. Installation
+uses Git's effective hooks directory, including `core.hooksPath` and worktrees.
+If an existing hook is present, cgen backs it up and runs it first. Uninstall
+only removes a recognized cgen wrapper and restores that exact backup.
+
+The hook generates only for normal commits whose message is still empty apart
+from Git comments. Existing-hook failures stop the commit; model or generation
+failures produce a warning and let Git continue.
 
 ### `cgen prompt`
 

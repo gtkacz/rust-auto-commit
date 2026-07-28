@@ -16,6 +16,12 @@ executable is `cgen`; the crates.io package is `auto-commit-rs`.
   DeepSeek, OpenRouter, Mistral, Together, Fireworks, Perplexity, LM Studio,
   Ollama — plus any OpenAI-compatible custom endpoint. Local models need no API key.
 - **Review before committing** — accept, regenerate, edit in your editor, or cancel.
+- **Flexible generation** — stage tracked changes with `--all`, print a clean
+  message with `--stdout`, request multiple candidates, or add per-run guidance.
+- **Git hook integration** — generate messages automatically from
+  `prepare-commit-msg` while preserving and chaining an existing hook.
+- **Live model discovery** — search provider model catalogs with `cgen model`
+  or from the configuration editor.
 - **Safety guards** — sensitive files and high-confidence secret patterns are
   blocked from the LLM payload; oversized diffs and large stagings require
   explicit confirmation.
@@ -73,8 +79,14 @@ cgen
 ```
 cgen                    # Generate commit message and commit
 cgen --dry-run          # Generate and show message without committing
+cgen --all              # Stage tracked modifications/deletions, then generate
+cgen --stdout           # Print only the generated message (for scripts)
+cgen --generate 3       # Generate and choose from three candidates
+cgen --prompt "focus on the API compatibility impact"
 cgen --tag              # Also create the next semantic version tag
 cgen config             # Interactive config editor (auto-detects scope)
+cgen model              # Discover and select a provider model
+cgen hook install       # Install repository-local Git hook integration
 cgen alter <hash>       # Regenerate message from that commit's diff and rewrite it
 cgen undo               # Undo latest commit with safety prompts (soft reset)
 cgen history            # Browse AI-generated commits for the current repo

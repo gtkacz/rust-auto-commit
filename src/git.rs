@@ -7,6 +7,20 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+/// Stage modifications and deletions to tracked files, matching `git commit -a`
+/// without adding untracked paths.
+pub fn stage_tracked_changes() -> Result<()> {
+    let output = Command::new("git")
+        .args(["add", "--update"])
+        .output()
+        .context("Failed to run git add --update")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git add --update failed: {stderr}");
+    }
+    Ok(())
+}
+
 /// Get the output of `git diff --staged`
 pub fn get_staged_diff() -> Result<String> {
     let output = Command::new("git")

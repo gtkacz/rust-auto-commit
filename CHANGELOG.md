@@ -9,15 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Lorem Ipsum
+- `--all` / `-a` staging of tracked modifications and deletions before generation
+- Exact machine-readable output with `--stdout`, including non-rewriting `alter`
+- Sequential multi-candidate generation and selection with `--generate N` / `-g N`
+- Invocation-only prompt guidance with `--prompt TEXT` / `-p TEXT`
+- Repository-local `prepare-commit-msg` management through `cgen hook`
+- Authenticated live model discovery and searchable selection through
+  `cgen model` and the configuration editor
 
 ### Changed
 
-- Lorem Ipsum
+- Generation, validation, fallback, templating, alter, stdout, and hook flows
+  now share one quiet-aware generation service
+- Multiple candidates receive recent results as distinct-alternative context
+  while retaining fallback and corrective validation for every provider call
 
 ### Fixed
 
-- Lorem ipsum
+- Forwarded exact `-a` / `--all` arguments now stage before diff inspection, so
+  the generated message and eventual commit always describe the same index
+- Quiet generation no longer leaks spinners, review UI, fallback notices, or
+  status text into machine-readable stdout
+- Hook installation safely chains/restores existing hooks and lets commits
+  continue when AI generation is unavailable
 
 ## [1.4.1] - 2026-07-23
 

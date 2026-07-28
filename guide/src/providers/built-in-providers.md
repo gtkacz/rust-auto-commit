@@ -5,6 +5,15 @@ Built-in providers work with just `ACR_PROVIDER` and (for cloud providers)
 automatically. Selecting a provider in `cgen config` also sets its default
 model, which you can override with `ACR_MODEL`.
 
+Run `cgen model` (or edit **Model** inside `cgen config`) to fetch the
+provider's current model catalog, search it, and persist a selection. Discovery
+uses short timeouts and bounded responses, authenticates with the configured
+credentials, and filters non-generation models when the provider exposes that
+metadata. OpenAI, Anthropic, Gemini, Groq, Grok, DeepSeek, OpenRouter, Mistral,
+Together, Fireworks, LM Studio, and Ollama support live discovery. Perplexity
+uses the manual fallback because its current list endpoint is for a different
+API surface.
+
 | Provider | Default Model | API key |
 |----------|---------------|---------|
 | `groq` (default) | llama-3.3-70b-versatile | required |
@@ -35,6 +44,10 @@ export ACR_PROVIDER=vllm
 export ACR_API_URL=http://localhost:8000/v1/chat/completions
 export ACR_MODEL=meta-llama/Llama-3-8B
 ```
+
+For custom providers, `cgen model` derives `/models` only when the configured
+URL ends in the recognizable `/chat/completions` path. Other endpoint shapes
+fall back to current/default/manual selection rather than guessing a URL.
 
 To make a provider available to everyone as a built-in, see
 [Adding a New Default Provider](../contributing.md#adding-a-new-default-provider)

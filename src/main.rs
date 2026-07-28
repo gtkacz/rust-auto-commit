@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use auto_commit_rs::{
-    cache, cli, config, editor, git, preset, prompt, provider, ui, update, workflow,
+    cache, cli, config, editor, generation, git, preset, prompt, provider, ui, update, workflow,
 };
 use colored::Colorize;
 use inquire::Select;
+use std::io::IsTerminal;
 use std::time::Instant;
 
 fn main() {
@@ -15,14 +16,19 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = cli::parse();
+    validate_invocation(&cli)?;
     let cfg = match &cli.command {
         Some(
             cli::Command::Config
             | cli::Command::Update
             | cli::Command::History
             | cli::Command::Preset
-            | cli::Command::Fallback,
+            | cli::Command::Fallback
+            | cli::Command::Model,
         ) => None,
+        Some(cli::Command::Hook {
+            action: cli::HookAction::Install | cli::HookAction::Uninstall | cli::HookAction::Status,
+        }) => None,
         _ => {
             let mut c = config::AppConfig::load()?;
             c.apply_overrides(&cli.set)?;
@@ -31,7 +37,7 @@ fn run() -> Result<()> {
     };
 
     // On first run, ask about auto-update preference
-    if let Some(ref c) = cfg {
+    if let Some(c) = cfg.as_ref().filter(|_| !cli.stdout && !is_hook_run(&cli)) {
         if c.auto_update.is_none() {
             prompt_auto_update();
         }
@@ -46,9 +52,12 @@ fn run() -> Result<()> {
             | cli::Command::History
             | cli::Command::Preset
             | cli::Command::Fallback
+            | cli::Command::Model
+            | cli::Command::Hook { .. }
             | cli::Command::Prompt
             | cli::Command::Undo,
         ) => None,
+        _ if cli.stdout => None,
         _ => check_for_updates(cfg.as_ref()),
     };
 
@@ -67,6 +76,12 @@ fn run() -> Result<()> {
         }
         Some(cli::Command::Fallback) => {
             preset::interactive_fallback_order()?;
+        }
+        Some(cli::Command::Model) => {
+            auto_commit_rs::model::run_model_command()?;
+        }
+        Some(cli::Command::Hook { action }) => {
+            run_hook_command(action, cfg.as_ref())?;
         }
         Some(cli::Command::Undo) => {
             run_undo(cfg.as_ref().expect("config should be loaded"))?;
@@ -97,9 +112,95 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn is_hook_run(cli: &cli::Cli) -> bool {
+    matches!(
+        cli.command,
+        Some(cli::Command::Hook {
+            action: cli::HookAction::Run { .. }
+        })
+    )
+}
+
+fn forwarded_all(cli: &cli::Cli) -> bool {
+    cli.extra_args
+        .iter()
+        .any(|arg| arg == "-a" || arg == "--all")
+}
+
+fn commit_args(cli: &cli::Cli) -> Vec<String> {
+    cli.extra_args
+        .iter()
+        .filter(|arg| *arg != "-a" && *arg != "--all")
+        .cloned()
+        .collect()
+}
+
+fn validate_invocation(cli: &cli::Cli) -> Result<()> {
+    let generates = matches!(cli.command, None | Some(cli::Command::Alter { .. }));
+    if (cli.all || forwarded_all(cli)) && cli.command.is_some() {
+        anyhow::bail!("--all can only be used when generating from the current index");
+    }
+    if cli.stdout && !generates {
+        anyhow::bail!("--stdout is only supported for ordinary generation and `alter`");
+    }
+    if cli.stdout && cli.generate != 1 {
+        anyhow::bail!("--stdout requires --generate 1");
+    }
+    if cli.stdout && !commit_args(cli).is_empty() {
+        anyhow::bail!("--stdout cannot be used with arguments forwarded to git commit");
+    }
+    if cli.generate != 1 && !generates {
+        anyhow::bail!("--generate can only be used with commit-message generation");
+    }
+    if cli.prompt.is_some() && !generates {
+        anyhow::bail!("--prompt can only be used with ordinary or alter generation");
+    }
+    Ok(())
+}
+
+fn run_hook_command(action: &cli::HookAction, cfg: Option<&config::AppConfig>) -> Result<()> {
+    match action {
+        cli::HookAction::Install => {
+            let path = auto_commit_rs::hook::install()?;
+            println!("{} {}", "Installed hook:".green().bold(), path.display());
+        }
+        cli::HookAction::Uninstall => {
+            let path = auto_commit_rs::hook::uninstall()?;
+            println!("{} {}", "Uninstalled hook:".green().bold(), path.display());
+        }
+        cli::HookAction::Status => match auto_commit_rs::hook::status()? {
+            auto_commit_rs::hook::HookStatus::Installed { path } => {
+                println!("installed: {}", path.display());
+            }
+            auto_commit_rs::hook::HookStatus::NotInstalled => println!("not installed"),
+            auto_commit_rs::hook::HookStatus::Unmanaged { path } => {
+                println!(
+                    "not installed (unmanaged hook exists at {})",
+                    path.display()
+                );
+            }
+        },
+        cli::HookAction::Run {
+            message_file,
+            source,
+            ..
+        } => {
+            auto_commit_rs::hook::run(
+                message_file,
+                source.as_deref(),
+                cfg.expect("config should be loaded for hook run"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn run_standard_commit(cfg: &config::AppConfig, cli: &cli::Cli) -> Result<()> {
     ensure_api_key(cfg)?;
 
+    if cli.all || forwarded_all(cli) {
+        git::stage_tracked_changes()?;
+    }
     let staged_files = git::list_staged_files().context("Failed to list staged files")?;
 
     let excludes: Vec<String> = cfg
@@ -117,21 +218,28 @@ fn run_standard_commit(cfg: &config::AppConfig, cli: &cli::Cli) -> Result<()> {
         cli.allow_large_diff,
         cli.allow_sensitive,
     )?;
-    print_staged_files(&staged_files, &report.included_files);
+    if !cli.stdout {
+        print_staged_files(&staged_files, &report.included_files);
+    }
 
-    if let Some(prompt) = workflow::staged_files_warning(cfg, staged_files.len(), &report) {
-        if !ui::confirm(&prompt, false) {
-            println!("{}", "Commit cancelled.".dimmed());
-            return Ok(());
+    if !cli.stdout {
+        if let Some(prompt) = workflow::staged_files_warning(cfg, staged_files.len(), &report) {
+            if !ui::confirm(&prompt, false) {
+                println!("{}", "Commit cancelled.".dimmed());
+                return Ok(());
+            }
         }
     }
 
     let gen_start = Instant::now();
-    let Some((final_msg, time_to_ready)) =
-        generate_final_message(cfg, &diff, cli.verbose, gen_start)?
+    let Some((final_msg, time_to_ready)) = generate_final_message(cfg, &diff, cli, gen_start)?
     else {
         return Ok(());
     };
+    if cli.stdout {
+        println!("{final_msg}");
+        return Ok(());
+    }
     if cli.verbose {
         if let Some(elapsed) = time_to_ready {
             println!(
@@ -150,7 +258,7 @@ fn run_standard_commit(cfg: &config::AppConfig, cli: &cli::Cli) -> Result<()> {
         return Ok(());
     }
 
-    git::run_commit(&final_msg, &cli.extra_args, cfg.suppress_tool_output)
+    git::run_commit(&final_msg, &commit_args(cli), cfg.suppress_tool_output)
         .context("git commit failed")?;
 
     if cfg.track_generated_commits {
@@ -203,8 +311,12 @@ fn run_alter(cfg: &config::AppConfig, cli: &cli::Cli, commits: &[String]) -> Res
         cli.allow_sensitive,
     )?;
 
-    let target_is_pushed = git::commit_is_pushed(&target)?;
-    if target_is_pushed {
+    let target_is_pushed = if cli.stdout {
+        false
+    } else {
+        git::commit_is_pushed(&target)?
+    };
+    if !cli.stdout && target_is_pushed {
         let proceed = ui::confirm(
             "Target commit appears to be pushed already. Rewriting history may require a force push. Continue?",
             false,
@@ -216,11 +328,14 @@ fn run_alter(cfg: &config::AppConfig, cli: &cli::Cli, commits: &[String]) -> Res
     }
 
     let gen_start = Instant::now();
-    let Some((final_msg, time_to_ready)) =
-        generate_final_message(cfg, &diff, cli.verbose, gen_start)?
+    let Some((final_msg, time_to_ready)) = generate_final_message(cfg, &diff, cli, gen_start)?
     else {
         return Ok(());
     };
+    if cli.stdout {
+        println!("{final_msg}");
+        return Ok(());
+    }
     if cli.verbose {
         if let Some(elapsed) = time_to_ready {
             println!(
@@ -286,36 +401,66 @@ fn ensure_api_key(cfg: &config::AppConfig) -> Result<()> {
 fn generate_final_message(
     cfg: &config::AppConfig,
     diff: &str,
-    verbose: bool,
+    cli: &cli::Cli,
     gen_start: Instant,
 ) -> Result<Option<(String, Option<std::time::Duration>)>> {
-    let system_prompt = prompt::build_system_prompt(cfg);
-    if verbose {
+    if cli.generate > 1 && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        anyhow::bail!(
+            "Selecting from multiple generated candidates requires an interactive terminal"
+        );
+    }
+    if cli.generate > 5
+        && !ui::confirm(
+            &format!(
+                "Generate {} candidates? This will make at least {} provider calls.",
+                cli.generate, cli.generate
+            ),
+            false,
+        )
+    {
+        println!("{}", "Generation cancelled.".dimmed());
+        return Ok(None);
+    }
+
+    let system_prompt = prompt::build_system_prompt_with_guidance(cfg, cli.prompt.as_deref());
+    if cli.verbose {
         println!("\n{}", "LLM system prompt:".cyan().bold());
         println!("{system_prompt}\n");
     }
-    let (mut message, fallback_name) =
-        provider::generate_validated_message(cfg, &system_prompt, diff)?;
-
-    if let Some(ref name) = fallback_name {
-        println!(
-            "  {} Used fallback preset: {}",
-            "note:".yellow().bold(),
-            name
-        );
-    }
+    let output_mode = if cli.stdout {
+        provider::OutputMode::Quiet
+    } else {
+        provider::OutputMode::Interactive
+    };
 
     let mut time_to_ready: Option<std::time::Duration> = None;
-
-    let final_msg = if cfg.review_commit {
-        loop {
-            let candidate = cfg
-                .commit_template
-                .replace("$msg", message.trim())
-                .trim()
-                .to_string();
-            prompt::validate_final_message(&candidate)
-                .context("Commit template produced an invalid commit message")?;
+    let final_msg = loop {
+        let candidates = generation::generate_candidates(
+            cfg,
+            diff,
+            cli.generate,
+            cli.prompt.as_deref(),
+            output_mode,
+        )?;
+        if !cli.stdout {
+            for candidate in &candidates {
+                if let Some(name) = &candidate.fallback_preset {
+                    println!(
+                        "  {} Used fallback preset: {}",
+                        "note:".yellow().bold(),
+                        name
+                    );
+                }
+            }
+        }
+        let Some(message) = select_candidate(cfg, candidates, cli.stdout)? else {
+            return Ok(None);
+        };
+        if cli.stdout || !cfg.review_commit {
+            break generation::apply_template(cfg, &message)?;
+        }
+        let reviewed = loop {
+            let candidate = generation::apply_template(cfg, &message)?;
 
             if time_to_ready.is_none() {
                 time_to_ready = Some(gen_start.elapsed());
@@ -324,24 +469,13 @@ fn generate_final_message(
             println!("  {}\n", candidate);
 
             match review_message()? {
-                ReviewAction::Accept => break candidate,
-                ReviewAction::Regenerate => {
-                    let (new_message, fb) =
-                        provider::generate_validated_message(cfg, &system_prompt, diff)?;
-                    message = new_message;
-                    if let Some(ref name) = fb {
-                        println!(
-                            "  {} Used fallback preset: {}",
-                            "note:".yellow().bold(),
-                            name
-                        );
-                    }
-                }
+                ReviewAction::Accept => break Some(candidate),
+                ReviewAction::Regenerate => break None,
                 ReviewAction::Edit => {
                     let edited = editor::edit(&candidate)?;
                     let edited = edited.trim().to_string();
                     match prompt::validate_final_message(&edited) {
-                        Ok(()) => break edited,
+                        Ok(()) => break Some(edited),
                         Err(error) => {
                             println!("  {} {}", "invalid message:".red().bold(), error);
                             continue;
@@ -353,21 +487,62 @@ fn generate_final_message(
                     return Ok(None);
                 }
             }
+        };
+        if let Some(reviewed) = reviewed {
+            break reviewed;
         }
-    } else {
-        let final_msg = cfg
-            .commit_template
-            .replace("$msg", message.trim())
-            .trim()
-            .to_string();
-        prompt::validate_final_message(&final_msg)
-            .context("Commit template produced an invalid commit message")?;
-        time_to_ready = Some(gen_start.elapsed());
-        println!("\n{} {}", "Commit message:".green().bold(), final_msg);
-        final_msg
     };
 
+    if time_to_ready.is_none() {
+        time_to_ready = Some(gen_start.elapsed());
+    }
+    if !cli.stdout && !cfg.review_commit {
+        println!("\n{} {}", "Commit message:".green().bold(), final_msg);
+    }
+
     Ok(Some((final_msg, time_to_ready)))
+}
+
+fn select_candidate(
+    cfg: &config::AppConfig,
+    candidates: Vec<generation::GeneratedCandidate>,
+    quiet: bool,
+) -> Result<Option<String>> {
+    if candidates.len() == 1 {
+        return Ok(candidates
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.message));
+    }
+    if quiet {
+        anyhow::bail!("Multiple candidates cannot be selected in quiet output mode");
+    }
+    let labels = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let preview = generation::apply_template(cfg, &candidate.message)
+                .unwrap_or_else(|_| candidate.message.clone())
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            format!("Candidate {}: {}", index + 1, preview)
+        })
+        .collect::<Vec<_>>();
+    match Select::new("Choose a commit message:", labels.clone()).prompt() {
+        Ok(selected) => {
+            let index = labels
+                .iter()
+                .position(|label| label == &selected)
+                .expect("selected candidate must exist");
+            Ok(Some(candidates[index].message.clone()))
+        }
+        Err(_) => {
+            println!("{}", "Commit cancelled.".dimmed());
+            Ok(None)
+        }
+    }
 }
 
 fn create_semver_tag(cfg: &config::AppConfig) -> Result<Option<String>> {

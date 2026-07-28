@@ -13,6 +13,12 @@ const TOTAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 2_048;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    Interactive,
+    Quiet,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RequestFormat {
     Gemini,
@@ -27,6 +33,21 @@ struct ProviderDef {
     default_model: &'static str,
     format: RequestFormat,
     response_path: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelListParser {
+    Data,
+    Gemini,
+    Models,
+    Ollama,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelListSpec {
+    pub url: String,
+    pub headers: String,
+    pub parser: ModelListParser,
 }
 
 /// Built-in provider definitions
@@ -132,6 +153,76 @@ pub fn default_model_for(provider: &str) -> &'static str {
     get_provider(provider).map_or("", |p| p.default_model)
 }
 
+/// Resolve model-discovery metadata for a provider. An explicit endpoint is
+/// used only when it has a recognizable chat-completions shape, preventing
+/// guesses against arbitrary custom APIs.
+pub fn model_list_spec(cfg: &AppConfig) -> Option<ModelListSpec> {
+    if !cfg.api_url.trim().is_empty() {
+        let url = derive_models_url(&cfg.api_url)?;
+        let headers = if cfg.api_headers.is_empty() {
+            get_provider(&cfg.provider)
+                .map(|provider| provider.api_headers)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            cfg.api_headers.clone()
+        };
+        return Some(ModelListSpec {
+            url,
+            headers,
+            parser: ModelListParser::Data,
+        });
+    }
+
+    let (url, parser) = match cfg.provider.as_str() {
+        "openai" => ("https://api.openai.com/v1/models", ModelListParser::Data),
+        "anthropic" => ("https://api.anthropic.com/v1/models", ModelListParser::Data),
+        "gemini" => (
+            "https://generativelanguage.googleapis.com/v1beta/models?key=$ACR_API_KEY",
+            ModelListParser::Gemini,
+        ),
+        "groq" => (
+            "https://api.groq.com/openai/v1/models",
+            ModelListParser::Data,
+        ),
+        "grok" => ("https://api.x.ai/v1/models", ModelListParser::Data),
+        "deepseek" => ("https://api.deepseek.com/v1/models", ModelListParser::Data),
+        "openrouter" => ("https://openrouter.ai/api/v1/models", ModelListParser::Data),
+        "mistral" => ("https://api.mistral.ai/v1/models", ModelListParser::Data),
+        "together" => ("https://api.together.xyz/v1/models", ModelListParser::Data),
+        "fireworks" => (
+            "https://api.fireworks.ai/inference/v1/models",
+            ModelListParser::Data,
+        ),
+        "lm_studio" => (
+            "http://localhost:1234/api/v1/models",
+            ModelListParser::Models,
+        ),
+        "ollama" => ("http://localhost:11434/api/tags", ModelListParser::Ollama),
+        // Perplexity's current list endpoint describes a different API surface.
+        "perplexity" => return None,
+        _ => return None,
+    };
+    let headers = if cfg.api_headers.is_empty() {
+        get_provider(&cfg.provider)?.api_headers.to_string()
+    } else {
+        cfg.api_headers.clone()
+    };
+    Some(ModelListSpec {
+        url: url.to_string(),
+        headers,
+        parser,
+    })
+}
+
+fn derive_models_url(api_url: &str) -> Option<String> {
+    let trimmed = api_url.trim_end_matches('/');
+    let suffix = "/chat/completions";
+    trimmed
+        .strip_suffix(suffix)
+        .map(|base| format!("{base}/models"))
+}
+
 /// Returns true if the provider requires an API key (i.e. its header template references $ACR_API_KEY).
 pub fn provider_requires_api_key(cfg: &AppConfig) -> bool {
     let headers = if let Some(def) = get_provider(&cfg.provider) {
@@ -194,6 +285,7 @@ fn call_llm_inner(
     system_prompt: &str,
     user_prompt: &str,
     deadline: Instant,
+    output_mode: OutputMode,
 ) -> Result<String, LlmCallError> {
     let (url, headers_raw, format, response_path) =
         resolve_provider(cfg).map_err(LlmCallError::Other)?;
@@ -219,14 +311,17 @@ fn call_llm_inner(
         ));
     }
 
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg} {elapsed}")
-            .unwrap(),
-    );
-    spinner.set_message("Generating commit message...");
-    spinner.enable_steady_tick(Duration::from_millis(80));
+    let spinner = (output_mode == OutputMode::Interactive).then(|| {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg} {elapsed}")
+                .unwrap(),
+        );
+        spinner.set_message("Generating commit message...");
+        spinner.enable_steady_tick(Duration::from_millis(80));
+        spinner
+    });
 
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     let agent = AGENT.get_or_init(ureq::Agent::new_with_defaults);
@@ -248,7 +343,9 @@ fn call_llm_inner(
         .build()
         .send(body.as_slice());
 
-    spinner.finish_and_clear();
+    if let Some(spinner) = spinner {
+        spinner.finish_and_clear();
+    }
 
     let response = match response {
         Ok(resp) => resp,
@@ -298,8 +395,17 @@ pub fn call_llm_with_fallback(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<(String, Option<String>)> {
+    call_llm_with_fallback_mode(cfg, system_prompt, user_prompt, OutputMode::Interactive)
+}
+
+pub fn call_llm_with_fallback_mode(
+    cfg: &AppConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    output_mode: OutputMode,
+) -> Result<(String, Option<String>)> {
     let deadline = Instant::now() + TOTAL_REQUEST_TIMEOUT;
-    match call_llm_inner(cfg, system_prompt, user_prompt, deadline) {
+    match call_llm_inner(cfg, system_prompt, user_prompt, deadline, output_mode) {
         Ok(msg) => Ok((msg, None)),
         Err(primary_error) => {
             if !cfg.fallback_enabled || !primary_error.is_retryable() {
@@ -329,16 +435,18 @@ pub fn call_llm_with_fallback(
                     continue;
                 }
 
-                eprintln!(
-                    "{} Primary failed, trying: {}...",
-                    "fallback:".yellow().bold(),
-                    preset.name
-                );
+                if output_mode == OutputMode::Interactive {
+                    eprintln!(
+                        "{} Primary failed, trying: {}...",
+                        "fallback:".yellow().bold(),
+                        preset.name
+                    );
+                }
 
                 let mut temp_cfg = cfg.clone();
                 crate::preset::apply_preset_to_config(&mut temp_cfg, preset);
 
-                match call_llm_inner(&temp_cfg, system_prompt, user_prompt, deadline) {
+                match call_llm_inner(&temp_cfg, system_prompt, user_prompt, deadline, output_mode) {
                     Ok(msg) => return Ok((msg, Some(preset.name.clone()))),
                     Err(error) => {
                         let retryable = error.is_retryable();
@@ -370,23 +478,55 @@ pub fn generate_validated_message(
     system_prompt: &str,
     diff: &str,
 ) -> Result<(String, Option<String>)> {
-    let user_prompt = crate::prompt::build_user_prompt(diff);
+    generate_validated_message_with_context(cfg, system_prompt, diff, &[], OutputMode::Interactive)
+}
+
+pub fn generate_validated_message_with_context(
+    cfg: &AppConfig,
+    system_prompt: &str,
+    diff: &str,
+    previous: &[String],
+    output_mode: OutputMode,
+) -> Result<(String, Option<String>)> {
+    let user_prompt = crate::prompt::build_user_prompt_avoiding(diff, previous);
     let (raw, fallback) =
-        call_llm_with_fallback(cfg, system_prompt, &user_prompt).context("LLM API call failed")?;
+        call_llm_with_fallback_mode(cfg, system_prompt, &user_prompt, output_mode)
+            .context("LLM API call failed")?;
     let message = crate::prompt::clean_commit_message(&raw);
     let error = match crate::prompt::validate_commit_message(&message, cfg) {
         Ok(()) => return Ok((message, fallback)),
         Err(error) => error,
     };
 
-    println!(
-        "  {} LLM message failed validation ({error}); requesting a correction",
-        "note:".yellow().bold()
-    );
-    let correction_prompt =
+    if output_mode == OutputMode::Interactive {
+        println!(
+            "  {} LLM message failed validation ({error}); requesting a correction",
+            "note:".yellow().bold()
+        );
+    }
+    let mut correction_prompt =
         crate::prompt::build_correction_prompt(diff, &message, &error.to_string());
-    let (raw, fallback) = call_llm_with_fallback(cfg, system_prompt, &correction_prompt)
-        .context("LLM API call failed")?;
+    if !previous.is_empty() {
+        let recent = previous
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                format!(
+                    "<candidate_{}>\n{}\n</candidate_{}>",
+                    index + 1,
+                    candidate,
+                    index + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        correction_prompt.push_str(&format!(
+            "\n\n<recent_candidates>\n{recent}\n</recent_candidates>\n\nThe corrected result must remain meaningfully distinct from these recent candidates."
+        ));
+    }
+    let (raw, fallback) =
+        call_llm_with_fallback_mode(cfg, system_prompt, &correction_prompt, output_mode)
+            .context("LLM API call failed")?;
     let message = crate::prompt::clean_commit_message(&raw);
     crate::prompt::validate_commit_message(&message, cfg)
         .context("LLM returned an invalid commit message even after a corrective retry")?;
@@ -482,7 +622,7 @@ fn build_request_body(
 }
 
 /// Parse "Key: Value, Key2: Value2" header string into pairs
-fn parse_headers(raw: &str) -> Result<Vec<(String, String)>> {
+pub(crate) fn parse_headers(raw: &str) -> Result<Vec<(String, String)>> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -527,7 +667,7 @@ fn validate_header(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_bounded(mut reader: impl Read, limit: usize) -> Result<String> {
+pub(crate) fn read_bounded(mut reader: impl Read, limit: usize) -> Result<String> {
     let mut bytes = Vec::new();
     reader
         .by_ref()
@@ -540,7 +680,7 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> Result<String> {
     String::from_utf8(bytes).context("API response was not valid UTF-8")
 }
 
-fn redact(value: &str, api_key: &str) -> String {
+pub(crate) fn redact(value: &str, api_key: &str) -> String {
     if api_key.is_empty() {
         value.to_string()
     } else {

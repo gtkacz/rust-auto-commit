@@ -32,6 +32,39 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub tag: bool,
 
+    /// Stage all tracked modifications and deletions before generating
+    #[arg(long, short = 'a', global = true)]
+    pub all: bool,
+
+    /// Print exactly the generated commit message to stdout
+    #[arg(
+        long,
+        global = true,
+        conflicts_with_all = ["dry_run", "verbose", "tag"]
+    )]
+    pub stdout: bool,
+
+    /// Number of independently generated candidates
+    #[arg(
+        long,
+        short = 'g',
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = parse_positive_count,
+        global = true
+    )]
+    pub generate: usize,
+
+    /// Additional per-run content or style guidance
+    #[arg(
+        long,
+        short = 'p',
+        value_name = "TEXT",
+        value_parser = parse_nonempty_prompt,
+        global = true
+    )]
+    pub prompt: Option<String>,
+
     /// Override any setting for this run only (repeatable). Format: KEY=VALUE,
     /// e.g. --set model=gpt-4o --set one_liner=false. Keys are case-insensitive
     /// and accept '-' or '_'. Never persisted. `auto_update` cannot be overridden.
@@ -83,10 +116,56 @@ pub enum Command {
     Preset,
     /// Configure LLM fallback order
     Fallback,
+    /// Discover and select a model for the current provider
+    Model,
+    /// Manage the repository prepare-commit-msg hook
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookAction {
+    /// Install the cgen prepare-commit-msg hook
+    Install,
+    /// Uninstall the cgen prepare-commit-msg hook
+    Uninstall,
+    /// Show whether the cgen hook is installed
+    Status,
+    /// Internal entry point invoked by the installed Git hook
+    #[command(hide = true)]
+    Run {
+        #[arg(value_name = "MESSAGE_FILE")]
+        message_file: std::path::PathBuf,
+        #[arg(value_name = "SOURCE")]
+        source: Option<String>,
+        #[arg(value_name = "COMMIT")]
+        commit: Option<String>,
+    },
 }
 
 pub fn parse() -> Cli {
     Cli::parse()
+}
+
+fn parse_positive_count(value: &str) -> std::result::Result<usize, String> {
+    let count = value
+        .parse::<usize>()
+        .map_err(|_| format!("'{value}' is not a positive integer"))?;
+    if count == 0 {
+        return Err("candidate count must be greater than zero".into());
+    }
+    Ok(count)
+}
+
+fn parse_nonempty_prompt(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("prompt guidance cannot be empty".into())
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 /// What happens when a menu entry is selected
@@ -472,6 +551,13 @@ pub fn interactive_config(global: bool) -> Result<()> {
 
 fn edit_field(suffix: &str, cfg: &AppConfig) -> Option<String> {
     match suffix {
+        "MODEL" => match crate::model::select_model(cfg) {
+            Ok(model) => model,
+            Err(error) => {
+                println!("  {} {}", "error:".red().bold(), error);
+                None
+            }
+        },
         "PROVIDER" => {
             let choices = vec![
                 "gemini",

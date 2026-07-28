@@ -893,6 +893,30 @@ pub fn save_auto_update_preference(value: bool) -> Result<()> {
     })
 }
 
+/// Update only the existing global model field, preserving every other
+/// configuration value.
+pub fn save_global_model(model: &str) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        anyhow::bail!("Model cannot be empty");
+    }
+    let path = global_config_path().context("Could not determine global config directory")?;
+    crate::persistence::with_file_lock(&path, || {
+        let mut table: toml::Table = if path.exists() {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            content
+                .parse()
+                .with_context(|| format!("Failed to parse {}", path.display()))?
+        } else {
+            toml::Table::new()
+        };
+        table.insert("model".into(), toml::Value::String(model.to_string()));
+        let content = toml::to_string_pretty(&table).context("Failed to serialize config")?;
+        crate::persistence::atomic_write_unlocked(&path, content.as_bytes())
+    })
+}
+
 fn mask_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
     if chars.len() <= 8 {
