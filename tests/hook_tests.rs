@@ -24,7 +24,10 @@ fn install_chains_idempotently_and_uninstall_restores_existing_hook() {
     fs::write(&hook_path, original).unwrap();
 
     let installed = hook::install().unwrap();
-    assert_eq!(installed, hook_path);
+    assert_eq!(
+        installed.canonicalize().unwrap(),
+        hook_path.canonicalize().unwrap()
+    );
     assert!(matches!(
         hook::status().unwrap(),
         HookStatus::Installed { .. }
